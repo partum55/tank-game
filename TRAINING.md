@@ -113,3 +113,10 @@ GPU arena agreed: 0.86 vs 0.06 - which also confirms the simulator end to end). 
 ## Throughput facts (A100, 12 vCPU)
 Simulator only: 28k sps at 1k arenas ... 1.67M sps at 65k (time per step ~37 ms regardless: launch-bound). A full update (2048-4096 arenas):
 rollout 2.4 s + PPO 0.6 s. Evaluation (Rust, 48 games) took 16 s in one process; `--eval-procs` (default vCPUs-1) now spreads it.
+
+## CUDA graph rollout (`--cuda-graph auto|on|off`)
+`mytrain/rollout.py`: one rollout step (policy -> arena -> buffers) runs over static tensors; `static_env_step` copies fresh state back
+into the original tensors so a captured graph can be replayed (test: trajectories are bit-identical to the plain step). The step index is a
+device tensor, randomness uses the CUDA generator (graph-safe), and the simulator contains no host syncs. At start the trainer times
+the eager loop and the replay, prints both, and keeps the graph only if it works and is faster; any error falls back to eager.
+Expected: the ~37 ms/step launch overhead collapses, so rollouts get several times faster (not measured yet - no GPU where this was written).

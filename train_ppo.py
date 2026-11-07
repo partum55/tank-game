@@ -28,6 +28,7 @@ import torch.nn.functional as F
 import referee  # shared repo (referee.py)
 from tank_env import RuleBasedBot  # shared repo
 from mytrain.evalpool import EvalPool
+from mytrain.rollout import Rollout
 from mytrain.bundle import append_metrics, make_bundle, write_config
 from mytrain.gru_policy import FEATURE_DIM, NumpyGRUPolicy, write_standalone_agent
 from mytrain.selfplay_env import GAMMA, SelfPlayVecEnv
@@ -272,6 +273,9 @@ def main():
     ap.add_argument("--hof-size", type=int, default=60, help="hall-of-fame snapshots kept (old ones are thinned out at random)")
     ap.add_argument("--lr-final-frac", type=float, default=0.1, help="learning rate decays linearly to this fraction of --lr by the end of --steps")
     ap.add_argument("--eval-every", type=int, default=0, help="updates between evaluations on fixed maps; 0 = auto (20 CPU env / 8 GPU env)")
+    ap.add_argument("--cuda-graph", choices=["auto", "on", "off"], default="auto",
+                    help="record the whole rollout step as a CUDA graph (replayed with one launch: removes the CPU launch bottleneck "
+                         "of the GPU arena). auto = on for --env gpu on CUDA; it benchmarks itself and falls back to eager on any problem")
     ap.add_argument("--eval-procs", type=int, default=max(1, (os.cpu_count() or 2) - 1),
                     help="CPU processes for the Rust-engine evaluation (1 = in the trainer process)")
     ap.add_argument("--eval-maps", type=int, default=12, help="fixed maps per evaluation (x2 sides); few maps make the *best* pick a coin flip")
@@ -361,14 +365,11 @@ def main():
         env = CpuEnv(SelfPlayVecEnv(args.workers, args.envs_per_worker, args.seed, args.bot_prob, args.latest_prob), device)
     env.set_pool(pinned + hof)
 
-    obs = env.reset()
-    h = torch.zeros(N, args.hidden, device=device)
-    first = torch.ones(N, device=device)
+    want_graph = use_gpu and device.type == "cuda" and args.cuda_graph != "off"
+    ro = Rollout(net, env, T, args.hidden, device, args.reward_scale, FEATURE_DIM, graph=want_graph)
+    print(f"rollout: {ro.graph_note}", flush=True)
     eval_pool = None
     window = collections.deque(maxlen=4)  # episode stats of the last updates
-    B_obs = torch.zeros(T, N, FEATURE_DIM, device=device)
-    B_first, B_shoot, B_logp, B_val, B_rew, B_done = (torch.zeros(T, N, device=device) for _ in range(6))
-    B_move = torch.zeros(T, N, 3, device=device)
 
     try:
         for update in range(update0 + 1, total_updates + 1):
@@ -376,28 +377,17 @@ def main():
             lr = args.lr * (1.0 - (1.0 - args.lr_final_frac) * min(1.0, steps_done / args.steps))
             for group in opt.param_groups:
                 group["lr"] = lr
-            h0 = h.clone()
-            # ---------------- rollout ----------------
-            for t in range(T):
-                B_obs[t], B_first[t] = obs, first
-                with torch.no_grad():
-                    out, val, h = net.step(obs, h, first)
-                    std = net.log_std.exp()
-                    move = out[:, :3] + std * torch.randn_like(out[:, :3])
-                    shoot = torch.bernoulli(torch.sigmoid(out[:, 3]))
-                    logp, _ = net.logp_entropy(out, move, shoot)
-                act = torch.cat([move.clamp(-1, 1), (shoot * 2 - 1).unsqueeze(1)], dim=1)
-                nxt, rew, done = env.step(act)
-                B_move[t], B_shoot[t], B_logp[t], B_val[t] = move, shoot, logp, val
-                B_rew[t] = rew * args.reward_scale
-                B_done[t] = done
-                obs, first = nxt, done
+            h0 = ro.h.clone()
+            # ---------------- rollout (T steps; eager or one CUDA-graph launch per step) ----------------
+            ro.run()
+            B_obs, B_first, B_move, B_shoot, B_logp, B_val, B_rew, B_done = (
+                ro.obs_buf, ro.first_buf, ro.move_buf, ro.shoot_buf, ro.logp_buf, ro.val_buf, ro.rew_buf, ro.done_buf)
             window.append(env.pop_stats())
             steps_done += N * T
             t_roll = time.time() - t0
             # ---------------- GAE ----------------
             with torch.no_grad():
-                _, last_val, _ = net.step(obs, h, first)
+                _, last_val, _ = net.step(ro.obs, ro.h, ro.first)
             adv = torch.zeros(T, N, device=device)
             gae = torch.zeros(N, device=device)
             for t in reversed(range(T)):

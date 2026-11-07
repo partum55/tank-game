@@ -151,6 +151,7 @@ class GpuArena:
         self.mem_pos, self.mem_turret, self.mem_hp = f(E, 2, 2), f(E, 2), f(E, 2)
         self.mem_unseen = torch.zeros(E, 2, dtype=torch.long, device=device)
         self.ray_angles = torch.tensor(RAY_ANGLES, device=device)
+        self.slot_ids = torch.arange(B, device=device)
         self.blocked = torch.zeros(E, 2, dtype=torch.bool, device=device)
         self.reset(torch.ones(E, dtype=torch.bool, device=device), self.random_maps())
 
@@ -222,7 +223,7 @@ class GpuArena:
             blocked = segment_hits_rect(self.pos[:, i], spawn, self.rects)
             ok = can[:, i] & ~blocked
             slot = (~self.bactive).float().argmax(1)
-            one = torch.nn.functional.one_hot(slot, self.B).bool() & ok[:, None]
+            one = (self.slot_ids == slot[:, None]) & ok[:, None]   # no one_hot: nothing may sync the host (CUDA graphs)
             self.bpos = torch.where(one.unsqueeze(-1), spawn[:, None], self.bpos)
             self.bvel = torch.where(one.unsqueeze(-1), (d * BULLET_SPEED)[:, None], self.bvel)
             self.bowner = torch.where(one, torch.full_like(self.bowner, i), self.bowner)
