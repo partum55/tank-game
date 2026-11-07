@@ -7,7 +7,7 @@ and saves everything to Google Drive (a disconnect just means "run the cells aga
 ```bash
 # needs the shared playground checked out next to this folder and its arena built
 # (headless: maturin develop --release --no-default-features, run inside ../playground)
-PYTHONPATH=../playground/python:. python3 train_ppo.py --save-dir runs/a --workers 11 --envs-per-worker 16 --steps 50e6
+PYTHONPATH=../playground/python:. python3 train_ppo.py --save-dir runs/a  --steps 50e6
 ```
 
 ## What it trains
@@ -67,3 +67,8 @@ Zip that folder (the Colab notebook has a cell that downloads it as `tank_bundle
 rule-based bot, latest vs older snapshots) and a verdict: *not done yet* (still beats its own past -> `--resume` with more `--steps`),
 *plateau* (strong vs the bot, flat curve -> go duel the real opponent), *stuck* (don't just run longer: entropy / draw rate / reward).
 Needs the shared arena repo next to this one (same rules version; `assess.py` warns on a mismatch).
+
+## Hardware adapts automatically
+`--workers` defaults to (vCPUs - 1) and `--envs-per-worker` to `ceil(--target-envs / workers)` (176 arenas in total), so the PPO batch
+(~22k samples per update) is the same on a 2-vCPU free runtime and on a 12-vCPU one: weaker hardware is just slower (`sps` in the log),
+not a different training. The GPU is used if present, otherwise the update runs on the CPU.

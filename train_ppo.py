@@ -131,7 +131,9 @@ def main():
     ap.add_argument("--save-dir", default="runs/ppo")
     ap.add_argument("--steps", type=float, default=50e6, help="total environment steps (learner side)")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
-    ap.add_argument("--envs-per-worker", type=int, default=16)
+    ap.add_argument("--target-envs", type=int, default=176,
+                    help="total arenas; the same PPO batch on any machine (spread over the workers)")
+    ap.add_argument("--envs-per-worker", type=int, default=0, help="0 = auto: ceil(target-envs / workers)")
     ap.add_argument("--rollout", type=int, default=128, help="steps per env per update")
     ap.add_argument("--hidden", type=int, default=256)
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -167,6 +169,7 @@ def main():
     net = Net(FEATURE_DIM, args.hidden, args.hidden).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=args.lr, eps=1e-5)
 
+    args.envs_per_worker = args.envs_per_worker or max(1, math.ceil(args.target_envs / args.workers))
     N, T = args.workers * args.envs_per_worker, args.rollout
     total_updates = args.updates or max(1, int(args.steps // (N * T)))
     update0, steps_done, best_score = 0, 0, -1.0
