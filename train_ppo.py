@@ -27,6 +27,7 @@ import torch.nn.functional as F
 
 import referee  # shared repo (referee.py)
 from tank_env import RuleBasedBot  # shared repo
+from mytrain.evalpool import EvalPool
 from mytrain.bundle import append_metrics, make_bundle, write_config
 from mytrain.gru_policy import FEATURE_DIM, NumpyGRUPolicy, write_standalone_agent
 from mytrain.selfplay_env import GAMMA, SelfPlayVecEnv
@@ -131,7 +132,7 @@ def export_params(net: Net) -> dict:
     sd = {k: v.detach().cpu().numpy().copy() for k, v in net.state_dict().items()}
     return dict(w_in=sd["inp.weight"], b_in=sd["inp.bias"], w_ih=sd["gru.weight_ih_l0"],
                 w_hh=sd["gru.weight_hh_l0"], b_ih=sd["gru.bias_ih_l0"], b_hh=sd["gru.bias_hh_l0"],
-                w_out=sd["actor.weight"], b_out=sd["actor.bias"])
+                w_out=sd["actor.weight"], b_out=sd["actor.bias"], log_std=sd["log_std"])
 
 
 def write_export(folder: str, params: dict):
@@ -166,14 +167,15 @@ def score(stats: dict, who: str = "A") -> float:
     return (s["wins"] + 0.5 * s["draws"]) / max(stats["games"], 1)
 
 
-def evaluate(params: dict, hof: list, maps: int):
-    """Fixed maps, both sides. Returns (score vs rule-based bot, score vs an old snapshot)."""
+def evaluate(params: dict, hof: list, maps: int, pool=None):
+    """Fixed maps, both sides, on the Rust engine. Returns (score vs rule-based bot, score vs an old snapshot)."""
     seeds = range(EVAL_SEED_BASE, EVAL_SEED_BASE + maps)
+    old = hof[1] if len(hof) > 1 else hof[0]
+    if pool is not None:
+        return pool.scores(params, old, seeds)
     me = NumpyGRUPolicy(params)
-    vs_bot = score(referee.play_series(me, RuleBasedBot(), seeds))
-    old = NumpyGRUPolicy(hof[1] if len(hof) > 1 else hof[0])
-    vs_old = score(referee.play_series(me, old, seeds))
-    return vs_bot, vs_old
+    return (score(referee.play_series(me, RuleBasedBot(), seeds)),
+            score(referee.play_series(me, NumpyGRUPolicy(old), seeds)))
 
 
 class _Tee:
@@ -270,6 +272,8 @@ def main():
     ap.add_argument("--hof-size", type=int, default=60, help="hall-of-fame snapshots kept (old ones are thinned out at random)")
     ap.add_argument("--lr-final-frac", type=float, default=0.1, help="learning rate decays linearly to this fraction of --lr by the end of --steps")
     ap.add_argument("--eval-every", type=int, default=0, help="updates between evaluations on fixed maps; 0 = auto (20 CPU env / 8 GPU env)")
+    ap.add_argument("--eval-procs", type=int, default=max(1, (os.cpu_count() or 2) - 1),
+                    help="CPU processes for the Rust-engine evaluation (1 = in the trainer process)")
     ap.add_argument("--eval-maps", type=int, default=12, help="fixed maps per evaluation (x2 sides); few maps make the *best* pick a coin flip")
     ap.add_argument("--save-every", type=int, default=0, help="updates between full checkpoints (last.pt); 0 = auto (10 CPU env / 4 GPU env)")
     ap.add_argument("--torch-threads", type=int, default=2)
@@ -360,6 +364,7 @@ def main():
     obs = env.reset()
     h = torch.zeros(N, args.hidden, device=device)
     first = torch.ones(N, device=device)
+    eval_pool = None
     window = collections.deque(maxlen=4)  # episode stats of the last updates
     B_obs = torch.zeros(T, N, FEATURE_DIM, device=device)
     B_first, B_shoot, B_logp, B_val, B_rew, B_done = (torch.zeros(T, N, device=device) for _ in range(6))
@@ -432,7 +437,9 @@ def main():
             line, ev_bot, ev_old = "", "", ""
             if update % args.eval_every == 0 or update == total_updates:
                 params = export_params(net)
-                vs_bot, vs_old = evaluate(params, hof, args.eval_maps)
+                if eval_pool is None and args.eval_procs > 1:
+                    eval_pool = EvalPool(args.eval_procs)  # first evaluation: start the worker processes once
+                vs_bot, vs_old = evaluate(params, hof, args.eval_maps, eval_pool)
                 ev_bot, ev_old = vs_bot, vs_old
                 line = f" | EVAL vs_bot {vs_bot:.2f} vs_old {vs_old:.2f}"
                 write_export(os.path.join(args.save_dir, "export_latest"), params)
@@ -472,6 +479,8 @@ def main():
                 make_bundle(args.save_dir)  # always-fresh hand-off folder on Drive
     finally:
         env.close()
+        if eval_pool is not None:
+            eval_pool.close()
 
     write_export(os.path.join(args.save_dir, "export_latest"), export_params(net))
     make_bundle(args.save_dir)

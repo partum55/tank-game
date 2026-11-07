@@ -14,6 +14,7 @@ import shutil
 import numpy as np
 
 PARAM_KEYS = ("w_in", "b_in", "w_ih", "w_hh", "b_ih", "b_hh", "w_out", "b_out")
+OPTIONAL_KEYS = ("log_std",)  # exploration noise of the moves; when present the agent acts like it was trained (see below)
 FEATURE_DIM = 27
 STANDALONE_FILE = "tank_gru_policy.py"
 AGENT_FILE = '''"""Auto-generated - NumPy only. Duel it: python referee.py <this file> <other agent>"""
@@ -71,8 +72,15 @@ def random_params(in_dim: int = FEATURE_DIM, emb: int = 64, hidden: int = 64, se
 class NumpyGRUPolicy:
     """Deterministic agent: act(obs) -> [thrust, turn, turret_turn, shoot]; reset() clears memory."""
 
-    def __init__(self, params: dict):
+    def __init__(self, params: dict, deterministic: bool = False, seed: int = 12345):
         self.p = {k: np.asarray(params[k], dtype=np.float32) for k in PARAM_KEYS}
+        # PPO trains a STOCHASTIC policy (Gaussian moves, Bernoulli shot). Such a policy can depend on its own noise, and the
+        # mean/threshold version of it may play far worse (measured: 0.89 vs 0.04 against the bot). So when the exploration
+        # noise is stored with the weights the agent keeps sampling, with a fixed seed re-applied on every reset().
+        self.log_std = np.asarray(params["log_std"], dtype=np.float32) if "log_std" in params else None
+        self.sample = self.log_std is not None and not deterministic
+        self._seed = seed
+        self.rng = np.random.default_rng(seed)
         self.hidden = self.p["w_hh"].shape[1]
         self.in_dim = self.p["w_in"].shape[1]
         if self.in_dim != FEATURE_DIM:
@@ -81,6 +89,7 @@ class NumpyGRUPolicy:
 
     def reset(self):
         self.h = np.zeros(self.hidden, dtype=np.float32)
+        self.rng = np.random.default_rng(self._seed)
 
     def forward(self, x: np.ndarray) -> np.ndarray:
         p, H = self.p, self.hidden
@@ -95,22 +104,29 @@ class NumpyGRUPolicy:
 
     def act(self, obs: dict):
         out = self.forward(features(obs))
-        move = np.clip(out[:3], -1.0, 1.0)
-        return [float(move[0]), float(move[1]), float(move[2]), 1.0 if out[3] > 0.0 else -1.0]
+        if self.sample:
+            move = np.clip(out[:3] + np.exp(self.log_std) * self.rng.standard_normal(3), -1.0, 1.0)
+            shoot = 1.0 if self.rng.random() < _sigmoid(out[3]) else -1.0
+        else:
+            move = np.clip(out[:3], -1.0, 1.0)
+            shoot = 1.0 if out[3] > 0.0 else -1.0
+        return [float(move[0]), float(move[1]), float(move[2]), shoot]
 
     def save(self, path: str):
-        np.savez_compressed(path, **self.p)
+        extra = {} if self.log_std is None else {"log_std": self.log_std}
+        np.savez_compressed(path, **self.p, **extra)
 
     @classmethod
-    def load(cls, path: str) -> "NumpyGRUPolicy":
+    def load(cls, path: str, deterministic: bool = False) -> "NumpyGRUPolicy":
         data = np.load(path)
-        return cls({k: data[k] for k in PARAM_KEYS})
+        return cls({k: data[k] for k in PARAM_KEYS + tuple(k for k in OPTIONAL_KEYS if k in data.files)}, deterministic)
 
 
 def write_standalone_agent(folder: str, params: dict):
     """folder/{agent.py, policy.npz, tank_gru_policy.py}: a self-contained agent for referee.py."""
     os.makedirs(folder, exist_ok=True)
-    np.savez_compressed(os.path.join(folder, "policy.npz"), **{k: params[k] for k in PARAM_KEYS})
+    np.savez_compressed(os.path.join(folder, "policy.npz"),
+                        **{k: params[k] for k in PARAM_KEYS + OPTIONAL_KEYS if k in params})
     shutil.copyfile(__file__, os.path.join(folder, STANDALONE_FILE))
     with open(os.path.join(folder, "agent.py"), "w") as f:
         f.write(AGENT_FILE)

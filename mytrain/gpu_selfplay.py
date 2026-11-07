@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 from .gpu_arena import DRAW_TIE, DRAW_TIMEOUT, GpuArena, MapBank, T1_WIN, T2_WIN, wrap, PI
-from .gru_policy import PARAM_KEYS
+from .gru_policy import OPTIONAL_KEYS, PARAM_KEYS
 from .selfplay_env import DRAW_EXTRA_PENALTY, GAMMA, LIVING_BONUS_IN_ENGINE, TIME_PENALTY, AIM_WEIGHT, DIST_WEIGHT
 
 BOT_TARGET_DIST = 0.25
@@ -48,6 +48,8 @@ class GpuSelfPlayEnv:
         self.bot_prob = bot_prob
         self.arena = GpuArena(num_envs, bank, device, max_steps)
         self.slot_w = None                      # dict of stacked tensors (S, ...)
+        self.slot_std = torch.zeros(slots, 3, device=device)          # exp(log_std) of each slot's policy
+        self.slot_stoch = torch.zeros(slots, dtype=torch.bool, device=device)  # snapshot carries its noise => it samples
         self._next_slot, self._last = 0, None
         z = lambda *s, dt=torch.float32: torch.zeros(*s, dtype=dt, device=device)
         self.side = z(num_envs, dt=torch.long)  # learner = tank `side`
@@ -64,6 +66,9 @@ class GpuSelfPlayEnv:
             self.slot_w = {k: v.unsqueeze(0).repeat(self.S, *[1] * v.dim()).clone() for k, v in t.items()}
         for k, v in t.items():
             self.slot_w[k][slot] = v
+        has = "log_std" in params
+        self.slot_std[slot] = torch.exp(torch.as_tensor(np.asarray(params["log_std"], np.float32), device=self.device)) if has else 0.0
+        self.slot_stoch[slot] = has
 
     def set_pool(self, pool):
         if self.slot_w is None:
@@ -121,8 +126,13 @@ class GpuSelfPlayEnv:
                 m = (self.opp == s).unsqueeze(1)
                 self.opp_h = torch.where(m, h_new, self.opp_h)
                 out = torch.where(m, o, out)
-        move = out[:, :3].clamp(-1, 1)
-        net_act = torch.cat([move, torch.where(out[:, 3:4] > 0, 1.0, -1.0)], 1)
+        slot = self.opp.clamp(max=self.S - 1)
+        stoch = self.slot_stoch[slot].unsqueeze(1)
+        # same behaviour as the learner it was trained as: Gaussian moves, Bernoulli shot (deterministic if the snapshot has no noise)
+        move = (out[:, :3] + stoch * self.slot_std[slot] * torch.randn_like(out[:, :3])).clamp(-1, 1)
+        shoot = torch.where(stoch, torch.where(torch.rand_like(out[:, 3:4]) < torch.sigmoid(out[:, 3:4]), 1.0, -1.0),
+                            torch.where(out[:, 3:4] > 0, 1.0, -1.0))
+        net_act = torch.cat([move, shoot], 1)
         g = lambda t: self._pick_obs(t, which)
         bot = bot_action(g(ob.dist), g(ob.angle_to), g(ob.turret), g(ob.body), g(ob.visible), g(ob.lidar))
         return torch.where((self.opp == self.S).unsqueeze(1), bot, net_act)

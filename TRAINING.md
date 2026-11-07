@@ -102,3 +102,14 @@ Training-only: EVAL and the referee use the official Rust maps, so a harmful mix
 ## Measured on an A100
 ~52k env-steps/s at 2048 arenas x 128 steps (5 s per update). A run with 190 updates (50M steps) is far too short: judge a run only after
 >= 250 updates (`assess.py` says "too early" otherwise). Recommended: `--rollout 64 --steps 150e6` (~570 updates).
+
+## The agent samples, like the policy that was trained (important)
+PPO trains a stochastic policy: Gaussian noise on the three moves (`log_std`), Bernoulli shot. Such a policy may *depend on its own noise*.
+Measured on a real run: the same weights scored **0.89 vs the bot when sampling and 0.04 when playing mean/threshold** (Rust engine; the
+GPU arena agreed: 0.86 vs 0.06 - which also confirms the simulator end to end). So `log_std` is exported with the weights, and
+`NumpyGRUPolicy` (exports, evaluation, hall-of-fame opponents on CPU and GPU) samples with it, with a fixed seed that `reset()` re-applies
+(a match is reproducible). Exports without `log_std` (older bundles) fall back to the deterministic mean. `NumpyGRUPolicy(params, deterministic=True)` forces it.
+
+## Throughput facts (A100, 12 vCPU)
+Simulator only: 28k sps at 1k arenas ... 1.67M sps at 65k (time per step ~37 ms regardless: launch-bound). A full update (2048-4096 arenas):
+rollout 2.4 s + PPO 0.6 s. Evaluation (Rust, 48 games) took 16 s in one process; `--eval-procs` (default vCPUs-1) now spreads it.

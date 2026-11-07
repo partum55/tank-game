@@ -114,7 +114,7 @@ def test_torch_export_roundtrip_and_write_export(tmp_path):
 
     net = train_ppo.Net(27, 16, 16)
     params = train_ppo.export_params(net)
-    assert set(params) == set(PARAM_KEYS)
+    assert set(params) == set(PARAM_KEYS) | {"log_std"}  # the exploration noise travels with the weights
     train_ppo.write_export(str(tmp_path), params)  # same files a Colab run exports
     agent = load_agent(str(tmp_path / "agent.py"))
     r = referee.play_match(agent, load_agent("rule_based"), seed=11, max_steps=50)
@@ -183,3 +183,57 @@ def test_autotune_picks_a_size_from_a_monotone_benchmark():
     sizes = [e for e, _ in table]
     assert sizes == sorted(sizes) and sizes[0] == 64 and chosen in sizes
     assert all(sps > 0 for _, sps in table)
+
+
+def test_policy_with_stored_noise_samples_like_training_and_reset_replays_it():
+    params = dict(random_params(27, 16, 16, seed=4), log_std=np.array([-0.7, -0.7, -0.7], np.float32))
+    pol, det = NumpyGRUPolicy(params), NumpyGRUPolicy(params, deterministic=True)
+    assert pol.sample and not det.sample
+    obs = {}
+    first = [pol.act(obs) for _ in range(30)]
+    pol.reset()
+    assert [pol.act(obs) for _ in range(30)] == first          # reset() re-seeds: a match is reproducible
+    pol.reset(), det.reset()
+    mv = np.array([pol.act(obs)[:3] for _ in range(1500)])
+    det_mv = np.array(det.act(obs)[:3])
+    # the stored noise std is ~exp(-0.7) = 0.5 around the mean (clipping at +-1 only trims the tails)
+    assert 0.35 < (mv - det_mv).std(axis=0).mean() < 0.6
+    assert (np.array([pol.act(obs)[3] for _ in range(400)]) > 0).mean() not in (0.0, 1.0)  # the shot is Bernoulli, not a threshold
+
+
+def test_gpu_opponent_noise_matches_the_numpy_sampler():
+    torch = pytest.importorskip("torch")
+    from mytrain.gpu_arena import MapBank
+    from mytrain.gpu_selfplay import GpuSelfPlayEnv
+
+    E, hidden = 6000, 16
+    params = dict(random_params(27, hidden, hidden, seed=9), log_std=np.array([-0.7, -1.2, -0.7], np.float32))
+    bank = MapBank.from_rust([5], "cpu")
+    env = GpuSelfPlayEnv(E, bank, "cpu", hidden, slots=1, bot_prob=0.0)
+    env.set_pool([params])
+    env.reset()
+    env.side[:] = 0
+    env.opp[:] = 0
+    env.opp_h.zero_()
+    got = env._opp_action(env.ob).numpy()                      # all envs share one state -> a pure noise sample
+    pol = NumpyGRUPolicy(params, deterministic=True)
+    mean = pol.forward(env._pick_obs(env.ob.features(), 1 - env.side).numpy()[0])
+    assert np.allclose(got[:, :3].mean(0), np.clip(mean[:3], -1, 1), atol=0.05)
+    assert np.allclose(got[:, :3].std(0), np.exp([-0.7, -1.2, -0.7]), rtol=0.15)
+    assert abs((got[:, 3] > 0).mean() - 1 / (1 + np.exp(-mean[3]))) < 0.03
+
+
+def test_parallel_evaluation_equals_the_serial_one():
+    pytest.importorskip("torch")
+    from mytrain.evalpool import EvalPool
+    import train_ppo
+
+    a = dict(random_params(27, 16, 16, 1), log_std=np.array([-0.7] * 3, np.float32))
+    b = dict(random_params(27, 16, 16, 2), log_std=np.array([-0.7] * 3, np.float32))
+    serial = train_ppo.evaluate(a, [a, b], 4)
+    pool = EvalPool(2)
+    try:
+        parallel = train_ppo.evaluate(a, [a, b], 4, pool)
+    finally:
+        pool.close()
+    assert parallel == pytest.approx(serial)
