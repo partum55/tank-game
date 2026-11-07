@@ -120,3 +120,9 @@ into the original tensors so a captured graph can be replayed (test: trajectorie
 device tensor, randomness uses the CUDA generator (graph-safe), and the simulator contains no host syncs. At start the trainer times
 the eager loop and the replay, prints both, and keeps the graph only if it works and is faster; any error falls back to eager.
 Expected: the ~37 ms/step launch overhead collapses, so rollouts get several times faster (not measured yet - no GPU where this was written).
+
+## Choosing the final agent: `pick_best.py`
+`python3 pick_best.py bundle.zip [--maps 8] [--extra other/policy.npz] [--out runs/final]` plays a round-robin of every export and
+hall-of-fame snapshot in the bundle (plus the rule-based bot and any `--extra` policies) on the Rust engine, in parallel, and writes the
+highest-ranked one as a ready-to-duel agent folder. Training's own `export_best` is picked from 12-24 games and can be a lucky one; this
+tournament is the better selector. Exports without `log_std` (older bundles) are flagged because they play deterministically.
