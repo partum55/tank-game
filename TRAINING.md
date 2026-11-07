@@ -55,3 +55,15 @@ PYTHONPATH=playground/python python3 playground/python/referee.py export_best/ag
 - Throughput on an 8-core laptop, CPU only: arenas ~21k env-steps/s with 7 workers, PPO update on CPU ~2.4 s per 14k steps. On 12 vCPU + A100 expect roughly 25-30k steps/s overall (measure it: `sps` in the log).
 - `--steps 50e6` is a first target, not a guarantee. Curves usually show whether more is worth it.
 - Changing the rules (arena size, physics) invalidates old hall of fame/checkpoints — start a new `--save-dir`.
+
+## Handing a run over for review (`bundle`)
+The trainer writes `metrics.csv` (one row per update) and `config.json`, and refreshes `<save-dir>/bundle/` at every evaluation:
+config, metrics, `export_best/`, `export_latest/` and up to 6 evenly spaced hall-of-fame snapshots (~15 MB in total).
+Zip that folder (the Colab notebook has a cell that downloads it as `tank_bundle.zip`) and run
+
+    PYTHONPATH=../playground/python:. python3 assess.py tank_bundle.zip [--maps 30]
+
+`assess.py` prints the learning curve, trends of the last 20% vs the 20% before, fresh duels on unseen maps (latest/best vs the
+rule-based bot, latest vs older snapshots) and a verdict: *not done yet* (still beats its own past -> `--resume` with more `--steps`),
+*plateau* (strong vs the bot, flat curve -> go duel the real opponent), *stuck* (don't just run longer: entropy / draw rate / reward).
+Needs the shared arena repo next to this one (same rules version; `assess.py` warns on a mismatch).

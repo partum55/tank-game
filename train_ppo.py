@@ -26,6 +26,7 @@ import torch.nn.functional as F
 
 import referee  # shared repo (referee.py)
 from tank_env import RuleBasedBot  # shared repo
+from mytrain.bundle import append_metrics, make_bundle, write_config
 from mytrain.gru_policy import FEATURE_DIM, NumpyGRUPolicy, write_standalone_agent
 from mytrain.selfplay_env import GAMMA, SelfPlayVecEnv
 
@@ -179,6 +180,8 @@ def main():
 
     print(f"device={device} envs={N} ({args.workers}x{args.envs_per_worker}) rollout={T} "
           f"batch={N * T:,}/update updates={total_updates} params={sum(p.numel() for p in net.parameters()):,}")
+    write_config(args.save_dir, args, dict(device=str(device), num_envs=N, total_updates=total_updates,
+                                           params=sum(p.numel() for p in net.parameters())))
     env = SelfPlayVecEnv(args.workers, args.envs_per_worker, args.seed, args.bot_prob, args.latest_prob)
     env.set_pool(hof)
 
@@ -251,10 +254,11 @@ def main():
                     del hof[random.randrange(0, len(hof) - 4)]  # thin out old ones, keep the newest 4
                 np.savez_compressed(os.path.join(args.save_dir, "hof", f"snap_{update:05d}.npz"), **hof[-1])
                 env.set_pool(hof)
-            line = ""
+            line, ev_bot, ev_old = "", "", ""
             if update % args.eval_every == 0 or update == total_updates:
                 params = export_params(net)
                 vs_bot, vs_old = evaluate(params, hof, args.eval_maps)
+                ev_bot, ev_old = vs_bot, vs_old
                 line = f" | EVAL vs_bot {vs_bot:.2f} vs_old {vs_old:.2f}"
                 write_export(os.path.join(args.save_dir, "export_latest"), params)
                 if vs_bot + vs_old > best_score:
@@ -275,10 +279,20 @@ def main():
                   f"(bot win {rate('bot', 'win'):.2f}) | ep_len {np.mean([e['steps'] for e in recent]) if recent else 0:5.0f} "
                   f"| pg {np.mean(stats['pg']):+.3f} v {np.mean(stats['v']):.3f} ent {np.mean(stats['ent']):.2f} "
                   f"kl {np.mean(stats['kl']):.4f} | roll {t_roll:.1f}s upd {dt - t_roll:.1f}s{line}", flush=True)
+            append_metrics(args.save_dir, dict(
+                update=update, steps=steps_done, sps=round(N * T / dt), win=rate('all', 'win'), loss=rate('all', 'loss'),
+                draw=rate('all', 'draw'), bot_win=rate('bot', 'win'),
+                ep_len=np.mean([e['steps'] for e in recent]) if recent else "",
+                pg=np.mean(stats['pg']), v=np.mean(stats['v']), ent=np.mean(stats['ent']), kl=np.mean(stats['kl']),
+                eval_vs_bot=ev_bot, eval_vs_old=ev_old, time=round(time.time())))
+            if ev_bot != "":
+                make_bundle(args.save_dir)  # always-fresh hand-off folder on Drive
     finally:
         env.close()
 
     write_export(os.path.join(args.save_dir, "export_latest"), export_params(net))
+    make_bundle(args.save_dir)
+    print(f"bundle for review: {os.path.join(args.save_dir, 'bundle')}")
     print(f"done. duel it: PYTHONPATH=../playground/python python3 ../playground/python/referee.py {args.save_dir}/export_best/agent.py rule_based")
 
 

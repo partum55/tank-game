@@ -9,4 +9,6 @@ NumPy only), so the shared referee can duel them without any of this code.
     PYTHONPATH=../playground/python:. python3 train_ppo.py --save-dir runs/a --workers 11 --envs-per-worker 16
     pytest tests                       # torch tests skip without PyTorch
 
+Review a run: the trainer keeps `<save-dir>/bundle/` fresh (~15 MB); zip it and run `python3 assess.py bundle.zip`.
+
 Colab: `colab/train_colab.ipynb` (clones the arena repo and this one from GitHub; Drive only holds checkpoints). Details: `TRAINING.md`.

@@ -119,3 +119,26 @@ def test_torch_export_roundtrip_and_write_export(tmp_path):
     agent = load_agent(str(tmp_path / "agent.py"))
     r = referee.play_match(agent, load_agent("rule_based"), seed=11, max_steps=50)
     assert r["failed"] is None
+
+
+def test_bundle_contains_what_a_reviewer_needs(tmp_path):
+    import argparse, json, os
+    from mytrain.bundle import append_metrics, make_bundle, write_config
+
+    run = tmp_path / "run"
+    (run / "hof").mkdir(parents=True)
+    for u in range(10, 101, 10):  # 10 snapshots -> bundle keeps 6 evenly spaced
+        NumpyGRUPolicy(random_params(27, 8, 8, u)).save(str(run / "hof" / f"snap_{u:05d}.npz"))
+    write_standalone_agent(str(run / "export_best"), random_params(27, 8, 8, 1))
+    write_standalone_agent(str(run / "export_latest"), random_params(27, 8, 8, 2))
+    write_config(str(run), argparse.Namespace(hidden=8, seed=1), {"num_envs": 4})
+    write_config(str(run), argparse.Namespace(hidden=8, seed=1), {"num_envs": 4})  # resumed session
+    append_metrics(str(run), dict(update=1, steps=100, win=0.5, eval_vs_bot=0.4))
+    out = make_bundle(str(run))
+    names = set(os.listdir(out))
+    assert {"config.json", "metrics.csv", "export_best", "export_latest", "hof"} <= names
+    snaps = sorted(os.listdir(os.path.join(out, "hof")))
+    assert len(snaps) == 6 and snaps[0] == "snap_00010.npz" and snaps[-1] == "snap_00100.npz"
+    cfg = json.load(open(os.path.join(out, "config.json")))
+    assert cfg["rules_version"] and len(cfg["runs"]) == 2
+    assert load_agent(os.path.join(out, "export_best", "agent.py")).act({})  # the bundled agent runs
