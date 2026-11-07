@@ -247,7 +247,10 @@ def main():
     ap.add_argument("--max-envs", type=int, default=65536, help="upper bound for the auto benchmark")
     ap.add_argument("--min-updates", type=int, default=400, help="auto sizing keeps at least this many PPO updates per run")
     ap.add_argument("--slots", type=int, default=6, help="hall-of-fame snapshots on stage at once (--env gpu)")
-    ap.add_argument("--map-bank", type=int, default=20000, help="Rust-generated maps for --env gpu")
+    ap.add_argument("--map-bank", type=int, default=20000, help="Rust-generated (official) maps for --env gpu")
+    ap.add_argument("--map-mix", type=float, default=0.3,
+                    help="share of extra TRAINING-ONLY arenas (open, sparse, dense, close, free spawns) next to the official maps, "
+                         "so movement does not depend on one layout; 0 = official maps only. Evaluation is always official.")
     ap.add_argument("--target-envs", type=int, default=176,
                     help="total arenas; the same PPO batch on any machine (spread over the workers)")
     ap.add_argument("--envs-per-worker", type=int, default=0, help="0 = auto: ceil(target-envs / workers)")
@@ -303,7 +306,13 @@ def main():
 
         seeds = random.Random(args.seed).sample(range(5_000_000), args.map_bank)  # training maps: seeds < 5M
         print(f"building {args.map_bank} Rust maps for the GPU arena ...", flush=True)
-        bank = MapBank.from_rust(seeds, device)
+        extra = []
+        if args.map_mix > 0:
+            from mytrain.mapmix import build_mix
+
+            extra = build_mix(int(args.map_bank * args.map_mix / (1 - args.map_mix)), args.seed)
+            print(f"  + {len(extra)} training-only arenas (open/sparse/dense/close/free)", flush=True)
+        bank = MapBank.from_rust(seeds, device, extra)
         if args.gpu_envs:
             N = args.gpu_envs
         else:

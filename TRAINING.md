@@ -92,3 +92,13 @@ less than 15% faster than the previous one (or out of memory, or `--max-envs`). 
 `steps / (rollout * min_updates)` (default `--min-updates 400`), because PPO learns per update and a 100k-arena batch gives only a handful
 of updates for a 200M budget. Rule of thumb: arenas ~ budget / 50k. To use the GPU more, raise `--steps` (e.g. 1000e6 -> ~16k arenas);
 `--gpu-envs N` overrides everything. TF32 matmuls are enabled on CUDA (the opponents' GRUs run ~several x faster on an A100).
+
+## Map variety (`--map-mix`, default 0.3)
+Next to the official maps the GPU arena trains on `mytrain/mapmix.py` layouts: open, sparse, dense, close-start, free spawns/headings
+(same guarantees: point-symmetric, gaps >= 3 radii, spawns clear of walls). Goal: movement and aiming that do not depend on one layout.
+Training-only: EVAL and the referee use the official Rust maps, so a harmful mix shows up as a gap between training and `EVAL`
+(`--map-mix 0` switches it off).
+
+## Measured on an A100
+~52k env-steps/s at 2048 arenas x 128 steps (5 s per update). A run with 190 updates (50M steps) is far too short: judge a run only after
+>= 250 updates (`assess.py` says "too early" otherwise). Recommended: `--rollout 64 --steps 150e6` (~570 updates).

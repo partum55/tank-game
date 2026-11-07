@@ -131,8 +131,9 @@ def main():
     improving = (mid >= 0.60) or (trend["eval_vs_old"] > 0.05 and trend["win"] > 0.0)
     strong = vs_bot >= 0.85
     print("\n== verdict")
-    if last["steps"] < 5e6:
-        print(f"  TOO EARLY to judge ({last['steps'] / 1e6:.1f}M steps < 5M): numbers below are noise-level; keep training.")
+    if last["steps"] < 5e6 or last["update"] < 250:
+        print(f"  TOO EARLY to judge ({last['steps'] / 1e6:.1f}M steps, {int(last['update'])} updates; need >= 5M steps AND >= 250 updates): "
+              "PPO learns per update, so a run with few huge updates has barely started. Keep training.")
     print(f"  vs bot {vs_bot:.2f} | vs mid-run snapshot {mid:.2f} | vs oldest snapshot {old_end:.2f} | "
           f"eval-vs-old trend {trend['eval_vs_old']:+.2f}")
     if improving and not strong:

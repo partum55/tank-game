@@ -90,7 +90,8 @@ class MapBank:
         self.k = rects.shape[1]
 
     @classmethod
-    def from_rust(cls, seeds, device):
+    def from_rust(cls, seeds, device, extra_maps=()):
+        """Official maps from the Rust generator (+ optional training-only `extra_maps`, see mapmix.py)."""
         from tank_env import TankEnvironment
 
         env = TankEnvironment(max_steps=10)
@@ -100,7 +101,12 @@ class MapBank:
             rects = [[x * W, y * H, w * W, h * H] for x, y, w, h in o1["obstacles"]]
             pos = [[o1["x"] * W, o1["y"] * H], [o2["x"] * W, o2["y"] * H]]
             maps.append((rects, pos, [o1["body_angle"], o2["body_angle"]]))
-        k = max(len(m[0]) for m in maps)
+        return cls.from_maps(maps + list(extra_maps), device)
+
+    @classmethod
+    def from_maps(cls, maps, device):
+        """maps: [(rects [(x,y,w,h)], pos [[x1,y1],[x2,y2]], angles [a1,a2])]"""
+        k = max(max(len(m[0]) for m in maps), 1)
         rects = np.tile(np.array(PAD_RECT, np.float32), (len(maps), k, 1))
         for i, m in enumerate(maps):
             if m[0]:
