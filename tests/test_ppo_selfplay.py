@@ -134,6 +134,7 @@ def test_bundle_contains_what_a_reviewer_needs(tmp_path):
     write_config(str(run), argparse.Namespace(hidden=8, seed=1), {"num_envs": 4})
     write_config(str(run), argparse.Namespace(hidden=8, seed=1), {"num_envs": 4})  # resumed session
     append_metrics(str(run), dict(update=1, steps=100, win=0.5, eval_vs_bot=0.4))
+    (run / "train.log").write_text("\n".join(f"line {i}" for i in range(1000)))
     out = make_bundle(str(run))
     names = set(os.listdir(out))
     assert {"config.json", "metrics.csv", "export_best", "export_latest", "hof"} <= names
@@ -142,6 +143,8 @@ def test_bundle_contains_what_a_reviewer_needs(tmp_path):
     cfg = json.load(open(os.path.join(out, "config.json")))
     assert cfg["rules_version"] and len(cfg["runs"]) == 2
     assert load_agent(os.path.join(out, "export_best", "agent.py")).act({})  # the bundled agent runs
+    log = open(os.path.join(out, "train_log.txt")).read().splitlines()
+    assert log[0] == "line 0" and log[-1] == "line 999" and any("trimmed" in l for l in log) and len(log) < 400
 
 
 def test_fused_unroll_matches_the_step_by_step_reference():

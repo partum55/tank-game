@@ -74,6 +74,16 @@ def main():
     if cfg.get("rules_version") != tank_env.RULES_VERSION:
         print("!! rules version differs from the arena checked out here - results are not comparable")
 
+    log = os.path.join(root, "train_log.txt")
+    if os.path.exists(log):
+        keys = ("session start", "device=", "auto-sizing", "saturates", "resumed")
+        print("\n== setup (from the training log)")
+        for line in open(log, errors="replace"):
+            if any(k in line for k in keys):
+                print("  " + line.rstrip()[:200])
+        tail = [l for l in open(log, errors="replace").read().splitlines() if l.startswith("upd")][-1:]
+        print("  last:", tail[0][:200] if tail else "-")
+
     print("\n== curve (win/loss/draw: last 400 episodes vs hall of fame + bot)")
     print(f"{'steps':>7} {'win':>5} {'draw':>5} {'botwin':>6} {'ep_len':>6} {'ent':>5}  eval(vs_bot/vs_old)")
     idx = sorted({int(i * (len(rows) - 1) / 9) for i in range(10)})

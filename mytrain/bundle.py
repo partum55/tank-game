@@ -6,6 +6,7 @@ Every update the trainer appends a row to metrics.csv; at every evaluation (and 
     config.json        settings, rules version, git revisions
     metrics.csv        per-update curve (win/loss/draw, vs rule-based, eval scores, losses, speed)
     export_best/ export_latest/    self-contained agents (agent.py + policy.npz + tank_gru_policy.py)
+    train_log.txt      head (device, GPU sizing) + tail of the console output
     hof/snap_*.npz     up to 6 evenly spaced hall-of-fame snapshots (oldest ... newest)
 Zip it and hand it over; `python assess.py <bundle-or-zip>` turns it into a verdict.
 """
@@ -65,6 +66,12 @@ def make_bundle(save_dir: str, max_snaps: int = 6) -> str:
     for name in ("export_best", "export_latest"):
         if os.path.isdir(os.path.join(save_dir, name)):
             shutil.copytree(os.path.join(save_dir, name), os.path.join(out, name))
+    log = os.path.join(save_dir, "train.log")
+    if os.path.exists(log):  # setup (device, GPU sizing table) at the top, recent progress at the bottom
+        lines = open(log, errors="replace").read().splitlines()
+        if len(lines) > 400:
+            lines = lines[:80] + [f"... ({len(lines) - 380} lines trimmed) ..."] + lines[-300:]
+        open(os.path.join(out, "train_log.txt"), "w").write("\n".join(lines) + "\n")
     snaps = sorted(glob.glob(os.path.join(save_dir, "hof", "snap_*.npz")))
     if snaps:
         k = min(max_snaps, len(snaps))

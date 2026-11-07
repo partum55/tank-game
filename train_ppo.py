@@ -17,6 +17,7 @@ import collections
 import math
 import os
 import random
+import sys
 import time
 
 import numpy as np
@@ -175,6 +176,21 @@ def evaluate(params: dict, hof: list, maps: int):
     return vs_bot, vs_old
 
 
+class _Tee:
+    """stdout -> console + <save-dir>/train.log (the bundle carries its head and tail)."""
+
+    def __init__(self, console, file):
+        self.console, self.file = console, file
+
+    def write(self, text):
+        self.console.write(text)
+        self.file.write(text)
+
+    def flush(self):
+        self.console.flush()
+        self.file.flush()
+
+
 def autotune_envs(bank, device, hidden, slots, max_envs, floor=1024, gain=1.15):
     """
     Benchmark the GPU arena at doubling sizes. The step is launch-bound, so throughput grows almost linearly
@@ -268,6 +284,10 @@ def main():
     random.seed(args.seed), np.random.seed(args.seed), torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(os.path.join(args.save_dir, "hof"), exist_ok=True)
+    log_file = open(os.path.join(args.save_dir, "train.log"), "a", buffering=1)
+    sys.stdout = _Tee(sys.stdout, log_file)
+    print(f"=== session start {time.strftime('%Y-%m-%d %H:%M:%S')} | torch {torch.__version__} | "
+          f"{torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no GPU'} | {os.cpu_count()} vCPU ===", flush=True)
     net = Net(FEATURE_DIM, args.hidden, args.hidden).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=args.lr, eps=1e-5)
 
