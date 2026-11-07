@@ -202,9 +202,10 @@ def main():
     ap.add_argument("--bot-prob", type=float, default=0.2, help="share of episodes against the rule-based anchor")
     ap.add_argument("--latest-prob", type=float, default=0.35, help="share of hall-of-fame games against the 2 newest snapshots")
     ap.add_argument("--snapshot-every", type=int, default=0, help="updates between hall-of-fame snapshots; 0 = auto (10 CPU env / 2 GPU env)")
-    ap.add_argument("--hof-size", type=int, default=30)
+    ap.add_argument("--hof-size", type=int, default=60, help="hall-of-fame snapshots kept (old ones are thinned out at random)")
+    ap.add_argument("--lr-final-frac", type=float, default=0.1, help="learning rate decays linearly to this fraction of --lr by the end of --steps")
     ap.add_argument("--eval-every", type=int, default=0, help="updates between evaluations on fixed maps; 0 = auto (20 CPU env / 8 GPU env)")
-    ap.add_argument("--eval-maps", type=int, default=6)
+    ap.add_argument("--eval-maps", type=int, default=12, help="fixed maps per evaluation (x2 sides); few maps make the *best* pick a coin flip")
     ap.add_argument("--save-every", type=int, default=0, help="updates between full checkpoints (last.pt); 0 = auto (10 CPU env / 4 GPU env)")
     ap.add_argument("--torch-threads", type=int, default=2)
     ap.add_argument("--seed", type=int, default=0)
@@ -234,11 +235,13 @@ def main():
     total_updates = args.updates or max(1, int(args.steps // (N * T)))
     update0, steps_done, best_score = 0, 0, -1.0
     hof = [export_params(net)]  # update 0: an untrained snapshot, so the very first games are easy
+    pinned = []                 # every new *best* export stays an opponent for good (guards against forgetting / cycling)
     last_path = os.path.join(args.save_dir, "last.pt")
     if args.resume and os.path.exists(last_path):
         ck = torch.load(last_path, map_location=device, weights_only=False)
         net.load_state_dict(ck["net"]), opt.load_state_dict(ck["opt"])
         update0, steps_done, best_score, hof = ck["update"], ck["steps"], ck["best"], ck["hof"]
+        pinned = ck.get("pinned", [])
         print(f"resumed from update {update0} ({steps_done:,} steps, hof={len(hof)})")
         if not args.updates:  # the batch size may differ from the run that wrote the checkpoint: count what is left in steps
             total_updates = update0 + max(0, math.ceil((args.steps - steps_done) / (N * T)))
@@ -257,7 +260,7 @@ def main():
         env = GpuSelfPlayEnv(N, MapBank.from_rust(seeds, device), device, args.hidden, args.slots, args.bot_prob)
     else:
         env = CpuEnv(SelfPlayVecEnv(args.workers, args.envs_per_worker, args.seed, args.bot_prob, args.latest_prob), device)
-    env.set_pool(hof)
+    env.set_pool(pinned + hof)
 
     obs = env.reset()
     h = torch.zeros(N, args.hidden, device=device)
@@ -270,6 +273,9 @@ def main():
     try:
         for update in range(update0 + 1, total_updates + 1):
             t0 = time.time()
+            lr = args.lr * (1.0 - (1.0 - args.lr_final_frac) * min(1.0, steps_done / args.steps))
+            for group in opt.param_groups:
+                group["lr"] = lr
             h0 = h.clone()
             # ---------------- rollout ----------------
             for t in range(T):
@@ -327,7 +333,7 @@ def main():
                 if len(hof) > args.hof_size:
                     del hof[random.randrange(0, len(hof) - 4)]  # thin out old ones, keep the newest 4
                 np.savez_compressed(os.path.join(args.save_dir, "hof", f"snap_{update:05d}.npz"), **hof[-1])
-                env.set_pool(hof)
+                env.set_pool(pinned + hof)
             line, ev_bot, ev_old = "", "", ""
             if update % args.eval_every == 0 or update == total_updates:
                 params = export_params(net)
@@ -339,9 +345,12 @@ def main():
                     best_score = vs_bot + vs_old
                     write_export(os.path.join(args.save_dir, "export_best"), params)
                     line += " *best"
+                    pinned.append(params)
+                    del pinned[:-12]  # at most 12 pinned bests
+                    env.set_pool(pinned + hof)
             if update % args.save_every == 0 or update == total_updates:
                 torch.save(dict(net=net.state_dict(), opt=opt.state_dict(), update=update, steps=steps_done,
-                                best=best_score, hof=hof), last_path)
+                                best=best_score, hof=hof, pinned=pinned), last_path)
 
             tot = lambda key: sum(w[key] for w in window)
 
