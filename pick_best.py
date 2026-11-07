@@ -42,8 +42,10 @@ def main():
     ap.add_argument("bundle")
     ap.add_argument("--maps", type=int, default=8, help="maps per pairing (each played on both sides)")
     ap.add_argument("--extra", nargs="*", default=[], help="more policy.npz files to include")
+    ap.add_argument("--only", nargs="*", default=None, help="restrict to these candidate names (a finals round with more maps)")
     ap.add_argument("--procs", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     ap.add_argument("--out", default=None, help="write the winner here as an agent folder")
+    ap.add_argument("--move-noise", type=float, default=None, help="move-noise scale baked into the written agent (0 = exact moves)")
     args = ap.parse_args()
 
     root = open_bundle(args.bundle)
@@ -56,6 +58,8 @@ def main():
         cands[os.path.basename(p)[:-4]] = p
     for p in args.extra:
         cands[os.path.basename(os.path.dirname(os.path.abspath(p))) or p] = p
+    if args.only:
+        cands = {n: cands[n] for n in ["bot"] + [x for x in args.only if x in cands and x != "bot"]}
     names = list(cands)
     seeds = list(range(SEED_BASE, SEED_BASE + args.maps))
     jobs = [(cands[a], cands[b], seeds) for a, b in itertools.combinations(names, 2)]
@@ -81,7 +85,7 @@ def main():
         from mytrain.gru_policy import OPTIONAL_KEYS, PARAM_KEYS, write_standalone_agent
 
         d = np.load(cands[winner])
-        write_standalone_agent(args.out, {k: d[k] for k in PARAM_KEYS + OPTIONAL_KEYS if k in d.files})
+        write_standalone_agent(args.out, {k: d[k] for k in PARAM_KEYS + OPTIONAL_KEYS if k in d.files}, args.move_noise)
         print(f"written: {args.out}/agent.py  (noise stored in the weights: {'log_std' in d.files})")
 
 

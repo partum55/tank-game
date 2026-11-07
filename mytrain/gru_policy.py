@@ -26,7 +26,7 @@ from tank_gru_policy import NumpyGRUPolicy
 
 
 def make_agent():
-    return NumpyGRUPolicy.load(Path(__file__).parent / "policy.npz")
+    return NumpyGRUPolicy.load(Path(__file__).parent / "policy.npz"__ARGS__)
 '''
 
 
@@ -124,7 +124,7 @@ def random_params(in_dim: int = FEATURE_DIM, emb: int = 64, hidden: int = 64, se
 class NumpyGRUPolicy:
     """Deterministic agent: act(obs) -> [thrust, turn, turret_turn, shoot]; reset() clears memory."""
 
-    def __init__(self, params: dict, deterministic: bool = False, seed: int = 12345):
+    def __init__(self, params: dict, deterministic: bool = False, seed: int = 12345, move_noise_scale=None):
         self.p = {k: np.asarray(params[k], dtype=np.float32) for k in PARAM_KEYS}
         # PPO trains a STOCHASTIC policy (Gaussian moves, Bernoulli shot). Such a policy can depend on its own noise, and the
         # mean/threshold version of it may play far worse (measured: 0.89 vs 0.04 against the bot). So when the exploration
@@ -132,6 +132,7 @@ class NumpyGRUPolicy:
         self.log_std = np.asarray(params["log_std"], dtype=np.float32) if "log_std" in params else None
         self.sample = self.log_std is not None and not deterministic
         self._seed = seed
+        self.move_noise_scale = MOVE_NOISE_SCALE if move_noise_scale is None else move_noise_scale
         self.rng = np.random.default_rng(seed)
         self.hidden = self.p["w_hh"].shape[1]
         self.in_dim = self.p["w_in"].shape[1]
@@ -157,7 +158,7 @@ class NumpyGRUPolicy:
     def act(self, obs: dict):
         out = self.forward(self.fx(obs))
         if self.sample:
-            move = np.clip(out[:3] + MOVE_NOISE_SCALE * np.exp(self.log_std) * self.rng.standard_normal(3), -1.0, 1.0)
+            move = np.clip(out[:3] + self.move_noise_scale * np.exp(self.log_std) * self.rng.standard_normal(3), -1.0, 1.0)
             shoot = 1.0 if self.rng.random() < _sigmoid(out[3]) else -1.0
         else:
             move = np.clip(out[:3], -1.0, 1.0)
@@ -169,16 +170,17 @@ class NumpyGRUPolicy:
         np.savez_compressed(path, **self.p, **extra)
 
     @classmethod
-    def load(cls, path: str, deterministic: bool = False) -> "NumpyGRUPolicy":
+    def load(cls, path: str, deterministic: bool = False, move_noise_scale=None) -> "NumpyGRUPolicy":
         data = np.load(path)
-        return cls({k: data[k] for k in PARAM_KEYS + tuple(k for k in OPTIONAL_KEYS if k in data.files)}, deterministic)
+        return cls({k: data[k] for k in PARAM_KEYS + tuple(k for k in OPTIONAL_KEYS if k in data.files)}, deterministic,
+                   move_noise_scale=move_noise_scale)
 
 
-def write_standalone_agent(folder: str, params: dict):
+def write_standalone_agent(folder: str, params: dict, move_noise_scale=None):
     """folder/{agent.py, policy.npz, tank_gru_policy.py}: a self-contained agent for referee.py."""
     os.makedirs(folder, exist_ok=True)
     np.savez_compressed(os.path.join(folder, "policy.npz"),
                         **{k: params[k] for k in PARAM_KEYS + OPTIONAL_KEYS if k in params})
     shutil.copyfile(__file__, os.path.join(folder, STANDALONE_FILE))
     with open(os.path.join(folder, "agent.py"), "w") as f:
-        f.write(AGENT_FILE)
+        f.write(AGENT_FILE.replace("__ARGS__", "" if move_noise_scale is None else f", move_noise_scale={move_noise_scale}"))
