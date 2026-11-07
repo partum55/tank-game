@@ -84,3 +84,11 @@ not a different training. The GPU is used if present, otherwise the update runs 
 GPU-env specifics: only `--slots` (6) hall-of-fame snapshots are "on stage" at once (a new snapshot replaces the oldest slot, otherwise one
 slot is re-drawn at random per refresh), so an env can meet a changed opponent mid-episode. Known deliberate difference from Rust: several
 bullets hitting one tank in the same tick all count (Rust lets a bullet after the killing one pass through) - last tick of an episode only.
+
+## GPU sizing (`--gpu-envs 0`, the default)
+The simulator step costs ~1.7k tiny kernels, so its time per step is almost independent of the number of arenas until the GPU
+saturates: throughput grows ~linearly with arenas. `autotune_envs` doubles the number of arenas (1024, 2048, ...) until a size is
+less than 15% faster than the previous one (or out of memory, or `--max-envs`). Then the number of arenas is capped by learning:
+`steps / (rollout * min_updates)` (default `--min-updates 400`), because PPO learns per update and a 100k-arena batch gives only a handful
+of updates for a 200M budget. Rule of thumb: arenas ~ budget / 50k. To use the GPU more, raise `--steps` (e.g. 1000e6 -> ~16k arenas);
+`--gpu-envs N` overrides everything. TF32 matmuls are enabled on CUDA (the opponents' GRUs run ~several x faster on an A100).

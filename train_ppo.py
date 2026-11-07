@@ -175,6 +175,48 @@ def evaluate(params: dict, hof: list, maps: int):
     return vs_bot, vs_old
 
 
+def autotune_envs(bank, device, hidden, slots, max_envs, floor=1024, gain=1.15):
+    """
+    Benchmark the GPU arena at doubling sizes. The step is launch-bound, so throughput grows almost linearly
+    until the GPU saturates; stop at the first size that is not at least `gain` x faster than the previous one
+    (or at an out-of-memory error / `max_envs`). Returns ([(envs, steps/s), ...], chosen_envs).
+    """
+    from mytrain.gpu_selfplay import GpuSelfPlayEnv
+    from mytrain.gru_policy import random_params
+
+    sync = torch.cuda.synchronize if device.type == "cuda" else (lambda: None)
+    pool = [random_params(27, hidden, hidden, 0)]
+    results, e = [], floor
+    while e <= max_envs:
+        try:
+            env = GpuSelfPlayEnv(e, bank, device, hidden, slots, 0.2)
+            env.set_pool(pool)
+            env.reset()
+            act = torch.zeros(e, 4, device=device)
+            for _ in range(3):
+                env.step(act)
+            sync()
+            t0 = time.time()
+            for _ in range(6):
+                env.step(act)
+            sync()
+            sps = 6 * e / (time.time() - t0)
+        except RuntimeError as err:  # CUDA out of memory
+            if "out of memory" not in str(err).lower():
+                raise
+            break
+        finally:
+            env = None
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+        results.append((e, sps))
+        if len(results) > 1 and sps < results[-2][1] * gain:
+            break
+        e *= 2
+    chosen = results[-2][0] if len(results) > 1 and results[-1][1] < results[-2][1] * gain else results[-1][0]
+    return results, chosen
+
+
 def main():
     ap = argparse.ArgumentParser(description="PPO + GRU + hall-of-fame self-play")
     ap.add_argument("--save-dir", default="runs/ppo")
@@ -183,7 +225,11 @@ def main():
     ap.add_argument("--env", choices=["auto", "cpu", "gpu"], default="auto",
                     help="where the arenas run: gpu = tensor re-implementation of the arena (thousands of envs, no CPU "
                          "bottleneck); cpu = the Rust engine in worker processes; auto = gpu if CUDA is available")
-    ap.add_argument("--gpu-envs", type=int, default=2048, help="parallel arenas for --env gpu")
+    ap.add_argument("--gpu-envs", type=int, default=0,
+                    help="parallel arenas for --env gpu; 0 = auto: benchmark where the GPU saturates, but keep at least "
+                         "--min-updates PPO updates in the --steps budget (more arenas than that makes learning worse, not faster)")
+    ap.add_argument("--max-envs", type=int, default=65536, help="upper bound for the auto benchmark")
+    ap.add_argument("--min-updates", type=int, default=400, help="auto sizing keeps at least this many PPO updates per run")
     ap.add_argument("--slots", type=int, default=6, help="hall-of-fame snapshots on stage at once (--env gpu)")
     ap.add_argument("--map-bank", type=int, default=20000, help="Rust-generated maps for --env gpu")
     ap.add_argument("--target-envs", type=int, default=176,
@@ -226,12 +272,35 @@ def main():
     opt = torch.optim.Adam(net.parameters(), lr=args.lr, eps=1e-5)
 
     use_gpu = args.env == "gpu" or (args.env == "auto" and device.type == "cuda")
-    args.minibatches = args.minibatches or (8 if use_gpu else 4)
     args.snapshot_every = args.snapshot_every or (2 if use_gpu else 10)
     args.eval_every = args.eval_every or (8 if use_gpu else 20)
     args.save_every = args.save_every or (4 if use_gpu else 10)
     args.envs_per_worker = args.envs_per_worker or max(1, math.ceil(args.target_envs / args.workers))
-    N, T = (args.gpu_envs if use_gpu else args.workers * args.envs_per_worker), args.rollout
+    T = args.rollout
+    bank = None
+    if use_gpu:
+        from mytrain.gpu_arena import MapBank
+
+        seeds = random.Random(args.seed).sample(range(5_000_000), args.map_bank)  # training maps: seeds < 5M
+        print(f"building {args.map_bank} Rust maps for the GPU arena ...", flush=True)
+        bank = MapBank.from_rust(seeds, device)
+        if args.gpu_envs:
+            N = args.gpu_envs
+        else:
+            if device.type == "cuda":
+                torch.backends.cuda.matmul.allow_tf32 = True  # A100: ~8x faster matmuls for the opponents
+                torch.backends.cudnn.allow_tf32 = True
+                table, saturated = autotune_envs(bank, device, args.hidden, args.slots, args.max_envs)
+            else:  # a CPU cannot "saturate": keep a modest fixed size
+                table, saturated = [], 512
+            by_budget = max(1024, 2 ** int(math.log2(max(1.0, args.steps / (T * args.min_updates)))))
+            N = min(saturated, by_budget)
+            print("auto-sizing the GPU arena: " + ", ".join(f"{e}: {sps / 1e3:,.0f}k sps" for e, sps in table))
+            print(f"  GPU saturates at {saturated} envs; the {args.steps / 1e6:,.0f}M-step budget allows {by_budget} "
+                  f"(>= {args.min_updates} updates) -> using {N}. More GPU use = a bigger --steps budget.")
+    else:
+        N = args.workers * args.envs_per_worker
+    args.minibatches = args.minibatches or (max(8, math.ceil(N / 2048)) if use_gpu else 4)
     total_updates = args.updates or max(1, int(args.steps // (N * T)))
     update0, steps_done, best_score = 0, 0, -1.0
     hof = [export_params(net)]  # update 0: an untrained snapshot, so the very first games are easy
@@ -252,12 +321,9 @@ def main():
     write_config(args.save_dir, args, dict(device=str(device), num_envs=N, total_updates=total_updates,
                                            params=sum(p.numel() for p in net.parameters())))
     if use_gpu:
-        from mytrain.gpu_arena import MapBank
         from mytrain.gpu_selfplay import GpuSelfPlayEnv
 
-        seeds = random.Random(args.seed).sample(range(5_000_000), args.map_bank)  # training maps: seeds < 5M
-        print(f"building {args.map_bank} Rust maps for the GPU arena ...", flush=True)
-        env = GpuSelfPlayEnv(N, MapBank.from_rust(seeds, device), device, args.hidden, args.slots, args.bot_prob)
+        env = GpuSelfPlayEnv(N, bank, device, args.hidden, args.slots, args.bot_prob)
     else:
         env = CpuEnv(SelfPlayVecEnv(args.workers, args.envs_per_worker, args.seed, args.bot_prob, args.latest_prob), device)
     env.set_pool(pinned + hof)
@@ -361,11 +427,12 @@ def main():
             ep_len = tot("len") / tot("n") if tot("n") else 0.0
 
             dt = time.time() - t0
+            vram = f" vram {torch.cuda.max_memory_allocated() / 1e9:.1f}GB" if device.type == "cuda" else ""
             print(f"upd {update:5d}/{total_updates} | {steps_done / 1e6:6.2f}M steps | {N * T / dt:7.0f} sps | "
                   f"win {rate('all', 'win'):.2f} loss {rate('all', 'loss'):.2f} draw {rate('all', 'draw'):.2f} "
                   f"(bot win {rate('bot', 'win'):.2f}) | ep_len {ep_len:5.0f} "
                   f"| pg {np.mean(stats['pg']):+.3f} v {np.mean(stats['v']):.3f} ent {np.mean(stats['ent']):.2f} "
-                  f"kl {np.mean(stats['kl']):.4f} | roll {t_roll:.1f}s upd {dt - t_roll:.1f}s{line}", flush=True)
+                  f"kl {np.mean(stats['kl']):.4f} | roll {t_roll:.1f}s upd {dt - t_roll:.1f}s{vram}{line}", flush=True)
             append_metrics(args.save_dir, dict(
                 update=update, steps=steps_done, sps=round(N * T / dt), win=rate('all', 'win'), loss=rate('all', 'loss'),
                 draw=rate('all', 'draw'), bot_win=rate('bot', 'win'),

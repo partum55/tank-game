@@ -168,3 +168,15 @@ def test_fused_unroll_matches_the_step_by_step_reference():
     (o1, v1, g1), (o2, v2, g2) = results
     assert torch.allclose(o1, o2, atol=1e-5) and torch.allclose(v1, v2, atol=1e-5)
     assert all(torch.allclose(a, b, atol=1e-4) for a, b in zip(g1, g2))
+
+
+def test_autotune_picks_a_size_from_a_monotone_benchmark():
+    torch = pytest.importorskip("torch")
+    import train_ppo
+    from mytrain.gpu_arena import MapBank
+
+    bank = MapBank.from_rust(list(range(20)), "cpu")
+    table, chosen = train_ppo.autotune_envs(bank, torch.device("cpu"), 16, 2, max_envs=256, floor=64)
+    sizes = [e for e, _ in table]
+    assert sizes == sorted(sizes) and sizes[0] == 64 and chosen in sizes
+    assert all(sps > 0 for _, sps in table)
