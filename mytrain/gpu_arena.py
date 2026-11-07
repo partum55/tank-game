@@ -122,7 +122,7 @@ class Obs:
         self.__dict__.update(kw)
 
     def features(self):
-        """The 27 inputs of the model (identical to mytrain.gru_policy.features on the Rust telemetry)."""
+        """The 31 inputs of the model (identical to mytrain.gru_policy.FeatureExtractor on the Rust telemetry)."""
         sc = lambda a: (torch.sin(a), torch.cos(a))
         s1, c1 = sc(self.body)
         s2, c2 = sc(self.turret - self.body)
@@ -131,7 +131,8 @@ class Obs:
         cols = [self.speed, self.vx, self.vy, s1, c1, s2, c2, self.hp / 100.0, self.reload,
                 self.rel_x, self.rel_y, self.dist, s3, c3, s4, c4, self.enemy_hp / 100.0,
                 self.visible.float(), self.last_seen]
-        return torch.cat([torch.stack(cols, -1), self.lidar], -1)
+        extra = torch.stack([self.ev_fwd, self.ev_side, torch.sin(self.lead_err), torch.cos(self.lead_err)], -1)
+        return torch.cat([torch.stack(cols, -1), self.lidar, extra], -1)
 
 
 class GpuArena:
@@ -153,6 +154,9 @@ class GpuArena:
         self.ray_angles = torch.tensor(RAY_ANGLES, device=device)
         self.slot_ids = torch.arange(B, device=device)
         self.blocked = torch.zeros(E, 2, dtype=torch.bool, device=device)
+        self.prev_en = f(E, 2, 2)                    # enemy position at the previous tick (for its velocity)
+        self.prev_vis = torch.zeros(E, 2, dtype=torch.bool, device=device)
+        self.blocked_move = torch.zeros(E, 2, dtype=torch.bool, device=device)   # tank commanded to move but stuck (wall / tank)
         self.reset(torch.ones(E, dtype=torch.bool, device=device), self.random_maps())
 
     def random_maps(self, n=None):
@@ -180,6 +184,9 @@ class GpuArena:
         self.mem_turret = torch.where(m1, self.turret.flip(1), self.mem_turret)
         self.mem_hp = torch.where(m1, self.hp.flip(1), self.mem_hp)
         self.mem_unseen = torch.where(m1, torch.zeros_like(self.mem_unseen), self.mem_unseen)
+        self.prev_vis = torch.where(m1, torch.zeros_like(self.prev_vis), self.prev_vis)
+        self.prev_en = torch.where(m2, self.pos.flip(1), self.prev_en)
+        self.blocked_move = torch.where(m1, torch.zeros_like(self.blocked_move), self.blocked_move)
         self._update_los()
 
     def _update_los(self):
@@ -198,6 +205,9 @@ class GpuArena:
         E, dev = self.E, self.device
         self.steps = self.steps + 1
         self.cooldown = (self.cooldown - 1).clamp_min(0)
+        self.prev_en = self.pos.flip(1)          # enemy position / visibility as last observed
+        self.prev_vis = self.visible()
+        pos_before = self.pos
         alive = self.alive
         thrust, turn, tt = (act[..., i].clamp(-1, 1) for i in range(3))
         shoot = act[..., 3] > 0.5
@@ -266,6 +276,8 @@ class GpuArena:
         vy = torch.where(((y < lo) & (vy < 0)) | ((y > hy) & (vy > 0)), torch.zeros_like(vy), vy)
         self.pos = torch.stack([x.clamp(lo, hx), y.clamp(lo, hy)], -1)
         self.vel = torch.stack([vx, vy], -1)
+        moved = (self.pos - pos_before).norm(dim=-1)
+        self.blocked_move = alive & (self.speed.abs() > 1.0) & (moved < 0.3 * self.speed.abs())   # driving into something
 
         # bullets
         nxt = self.bpos + self.bvel
@@ -330,6 +342,21 @@ class GpuArena:
         rel = seen_pos - me_pos
         angle_to = wrap(torch.atan2(rel[..., 1], rel[..., 0]) - self.body)
 
+        # enemy velocity = its move between two consecutive ticks in which it was visible, in the own-heading frame
+        v = torch.where((vis & self.prev_vis).unsqueeze(-1), en_pos - self.prev_en, torch.zeros_like(en_pos))
+        c_b, s_b = torch.cos(self.body), torch.sin(self.body)
+        ev_fwd = ((c_b * v[..., 0] + s_b * v[..., 1]) / MAX_SPEED).clamp(-2, 2)
+        ev_side = ((-s_b * v[..., 0] + c_b * v[..., 1]) / MAX_SPEED).clamp(-2, 2)
+        # where to aim: intercept of a bullet (constant speed) with the extrapolated enemy
+        a = (v * v).sum(-1) - BULLET_SPEED * BULLET_SPEED
+        a = a.clamp(max=-1e-6)
+        p = seen_pos - me_pos
+        b = 2.0 * (p * v).sum(-1)
+        c0 = (p * p).sum(-1)
+        t_hit = ((-b - (b * b - 4.0 * a * c0).clamp_min(0).sqrt()) / (2.0 * a)).clamp(0, 400)
+        q = p + v * t_hit.unsqueeze(-1)
+        lead_err = wrap(torch.atan2(q[..., 1], q[..., 0]) - self.turret)
+
         if lidar:
             # lidar: 8 rays, nearest of border / enemy tank / obstacle
             ang = wrap(self.body.unsqueeze(-1) + self.ray_angles)           # (E,2,8)
@@ -351,7 +378,8 @@ class GpuArena:
             vx=self.vel[..., 0] / MAX_SPEED, vy=self.vel[..., 1] / MAX_SPEED, hp=self.hp,
             reload=self.cooldown.float() / RELOAD, rel_x=rel[..., 0] / W, rel_y=rel[..., 1] / H,
             dist=rel.norm(dim=-1) / DIAG, angle_to=angle_to, enemy_turret=seen_turret, enemy_hp=seen_hp,
-            visible=vis, last_seen=unseen.float() / self.max_steps, lidar=lidar_t)
+            visible=vis, last_seen=unseen.float() / self.max_steps, lidar=lidar_t,
+            ev_fwd=ev_fwd, ev_side=ev_side, lead_err=lead_err)
 
     @staticmethod
     def _border_t(ox, oy, dx, dy):

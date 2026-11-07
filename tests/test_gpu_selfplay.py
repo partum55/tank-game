@@ -7,7 +7,7 @@ torch = pytest.importorskip("torch")
 from tank_env import RuleBasedBot, TankEnvironment
 from mytrain.gpu_arena import GpuArena, MapBank
 from mytrain.gpu_selfplay import GpuSelfPlayEnv, bot_action
-from mytrain.gru_policy import NumpyGRUPolicy, random_params
+from mytrain.gru_policy import FEATURE_DIM, NumpyGRUPolicy, random_params
 from tests.test_gpu_parity import random_actions
 
 
@@ -38,7 +38,7 @@ def test_bot_port_matches_the_python_bot():
 
 def test_in_tensor_gru_opponent_matches_the_numpy_policy():
     E, hidden = 4, 16
-    params = random_params(27, hidden, hidden, seed=3)
+    params = random_params(FEATURE_DIM, hidden, hidden, seed=3)
     bank = MapBank.from_rust(list(range(50, 60)), "cpu")
     env = GpuSelfPlayEnv(E, bank, "cpu", hidden, slots=2, bot_prob=0.0, max_steps=10_000)
     env.set_pool([params])
@@ -70,13 +70,13 @@ def test_in_tensor_gru_opponent_matches_the_numpy_policy():
 def test_stats_count_finished_episodes_and_rewards_are_finite():
     bank = MapBank.from_rust(list(range(70, 80)), "cpu")
     env = GpuSelfPlayEnv(32, bank, "cpu", 8, slots=2, bot_prob=0.5, max_steps=40)
-    env.set_pool([random_params(27, 8, 8, 1), random_params(27, 8, 8, 2)])
+    env.set_pool([random_params(FEATURE_DIM, 8, 8, 1), random_params(FEATURE_DIM, 8, 8, 2)])
     env.reset()
     for _ in range(100):
         act = torch.rand(32, 4) * 2 - 1
         act[:, 3] = torch.where(act[:, 3] > 0, 1.0, -1.0)
         obs, rew, done = env.step(act)
-        assert obs.shape == (32, 27) and torch.isfinite(obs).all() and torch.isfinite(rew).all()
+        assert obs.shape == (32, FEATURE_DIM) and torch.isfinite(obs).all() and torch.isfinite(rew).all()
     st = env.pop_stats()
     assert st["n"] >= 32 and abs(st["win"] + st["loss"] + st["draw"] - st["n"]) < 1e-6
     assert 0 < st["bot_n"] < st["n"]

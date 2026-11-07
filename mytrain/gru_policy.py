@@ -15,7 +15,10 @@ import numpy as np
 
 PARAM_KEYS = ("w_in", "b_in", "w_ih", "w_hh", "b_ih", "b_hh", "w_out", "b_out")
 OPTIONAL_KEYS = ("log_std",)  # exploration noise of the moves; when present the agent acts like it was trained (see below)
-FEATURE_DIM = 27
+BASE_DIM = 27       # position-free state, enemy (live or last known), fog flags, lidar
+FEATURE_DIM = 31    # + enemy velocity (2) and the aim error to the LEAD point (sin, cos)
+W, H, MAX_SPEED, BULLET_SPEED = 1200.0, 800.0, 4.5, 9.0
+MOVE_NOISE_SCALE = 0.5   # moves are played with exp(log_std) * 0.5: measured better than the full training noise (0.91 vs 0.83) and calmer
 STANDALONE_FILE = "tank_gru_policy.py"
 AGENT_FILE = '''"""Auto-generated - NumPy only. Duel it: python referee.py <this file> <other agent>"""
 from pathlib import Path
@@ -31,7 +34,7 @@ def _sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
 
 
-def features(raw: dict) -> np.ndarray:
+def base_features(raw: dict) -> np.ndarray:
     """27 normalized features from the raw telemetry (angles as sin/cos, no absolute x/y)."""
     body = raw.get("body_angle", 0.0)
 
@@ -53,6 +56,55 @@ def features(raw: dict) -> np.ndarray:
         *raw.get("lidar_rays", [1.0] * 8),
     ]
     return np.array(f, dtype=np.float32)
+
+
+def lead_angle_error(px, py, vx, vy, turret):
+    """Where to shoot at a moving target: angle between the turret and the intercept point (bullet speed is constant).
+    p = enemy - own (px), v = enemy velocity (px/tick). |p + v t| = s t has exactly one positive root since |v| < s."""
+    s2 = BULLET_SPEED * BULLET_SPEED
+    a = min(vx * vx + vy * vy - s2, -1e-6)
+    b = 2.0 * (px * vx + py * vy)
+    c = px * px + py * py
+    t = (-b - math.sqrt(max(b * b - 4.0 * a * c, 0.0))) / (2.0 * a)
+    t = min(max(t, 0.0), 400.0)
+    err = math.atan2(py + vy * t, px + vx * t) - turret
+    return math.atan2(math.sin(err), math.cos(err))
+
+
+class FeatureExtractor:
+    """
+    The model's inputs, computed from the raw telemetry. STATEFUL: the enemy's velocity is the change of its position between two
+    consecutive ticks in which it was visible (0 otherwise), so call it once per tick and `reset()` between matches.
+    dim 27 = the original inputs (older exports), dim 31 = + enemy velocity (own-heading frame) and the lead-aim error.
+    """
+
+    def __init__(self, dim: int = FEATURE_DIM):
+        if dim not in (BASE_DIM, FEATURE_DIM):
+            raise ValueError(f"unsupported feature size {dim} (expected {BASE_DIM} or {FEATURE_DIM})")
+        self.dim = dim
+        self.reset()
+
+    def reset(self):
+        self.prev = None          # (enemy position px, was visible) of the previous tick
+        self.lead_err = 0.0
+
+    def __call__(self, raw: dict) -> np.ndarray:
+        base = base_features(raw)
+        if self.dim == BASE_DIM:
+            return base
+        own = (raw.get("x", 0.0) * W, raw.get("y", 0.0) * H)
+        seen = (own[0] + raw.get("enemy_rel_x", 0.0) * W, own[1] + raw.get("enemy_rel_y", 0.0) * H)   # live, or last known
+        visible = bool(raw.get("enemy_visible", True))
+        vx = vy = 0.0
+        if self.prev is not None and visible and self.prev[1]:
+            vx, vy = seen[0] - self.prev[0][0], seen[1] - self.prev[0][1]
+        self.prev = (seen, visible)
+        body = raw.get("body_angle", 0.0)
+        c, s = math.cos(body), math.sin(body)
+        v_fwd, v_side = (c * vx + s * vy) / MAX_SPEED, (-s * vx + c * vy) / MAX_SPEED
+        self.lead_err = lead_angle_error(seen[0] - own[0], seen[1] - own[1], vx, vy, raw.get("turret_angle", 0.0))
+        return np.concatenate([base, np.array([min(max(v_fwd, -2.0), 2.0), min(max(v_side, -2.0), 2.0),
+                                               math.sin(self.lead_err), math.cos(self.lead_err)], np.float32)])
 
 
 def random_params(in_dim: int = FEATURE_DIM, emb: int = 64, hidden: int = 64, seed: int = 0) -> dict:
@@ -83,12 +135,12 @@ class NumpyGRUPolicy:
         self.rng = np.random.default_rng(seed)
         self.hidden = self.p["w_hh"].shape[1]
         self.in_dim = self.p["w_in"].shape[1]
-        if self.in_dim != FEATURE_DIM:
-            raise ValueError(f"policy expects {self.in_dim} inputs, features() gives {FEATURE_DIM}")
+        self.fx = FeatureExtractor(self.in_dim)   # raises for sizes this code does not know
         self.h = np.zeros(self.hidden, dtype=np.float32)
 
     def reset(self):
         self.h = np.zeros(self.hidden, dtype=np.float32)
+        self.fx.reset()
         self.rng = np.random.default_rng(self._seed)
 
     def forward(self, x: np.ndarray) -> np.ndarray:
@@ -103,9 +155,9 @@ class NumpyGRUPolicy:
         return p["w_out"] @ self.h + p["b_out"]
 
     def act(self, obs: dict):
-        out = self.forward(features(obs))
+        out = self.forward(self.fx(obs))
         if self.sample:
-            move = np.clip(out[:3] + np.exp(self.log_std) * self.rng.standard_normal(3), -1.0, 1.0)
+            move = np.clip(out[:3] + MOVE_NOISE_SCALE * np.exp(self.log_std) * self.rng.standard_normal(3), -1.0, 1.0)
             shoot = 1.0 if self.rng.random() < _sigmoid(out[3]) else -1.0
         else:
             move = np.clip(out[:3], -1.0, 1.0)

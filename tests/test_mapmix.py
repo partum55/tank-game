@@ -3,6 +3,8 @@ import math
 import numpy as np
 import pytest
 
+from mytrain.gru_policy import FEATURE_DIM
+
 from mytrain.mapmix import CLEARANCE, H, KINDS, RADIUS, W, _near, _overlaps, build_mix, synth_map
 
 
@@ -46,4 +48,4 @@ def test_gpu_arena_runs_on_mixed_maps_without_leaving_the_arena():
     p = arena.pos
     assert (p[..., 0] >= 17.9).all() and (p[..., 0] <= 1200 - 17.9).all() and (p[..., 1] >= 17.9).all() and (p[..., 1] <= 800 - 17.9).all()
     feats = arena.observe().features()
-    assert feats.shape == (E, 2, 27) and torch.isfinite(feats).all()
+    assert feats.shape == (E, 2, FEATURE_DIM) and torch.isfinite(feats).all()

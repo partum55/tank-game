@@ -6,7 +6,7 @@ torch = pytest.importorskip("torch")
 
 from tank_env import TankEnvironment
 from mytrain.gpu_arena import GpuArena, MapBank
-from mytrain.gru_policy import features
+from mytrain.gru_policy import FeatureExtractor
 
 SEEDS = list(range(100, 124))
 TICKS = 350
@@ -33,6 +33,7 @@ def replay(seeds, ticks, device="cpu", rust_actions=None):
     rust = [e.reset(seed=s) for e, s in zip(envs, seeds)]
     rng = np.random.default_rng(0)
     acts = np.stack([random_actions(rng, ticks) for _ in seeds], 1)  # (ticks, E, 2, 4)
+    fx = [[FeatureExtractor(), FeatureExtractor()] for _ in seeds]   # enemy velocity needs the previous tick
     feat_err = np.zeros((len(seeds), ticks))
     rew_err = np.zeros((len(seeds), ticks))
     done_mismatch = np.zeros(len(seeds), bool)
@@ -45,7 +46,7 @@ def replay(seeds, ticks, device="cpu", rust_actions=None):
             if finished[e]:
                 continue
             for i in (0, 1):
-                feat_err[e, t] = max(feat_err[e, t], np.abs(obs[e, i] - features(rust_obs[e][i])).max())
+                feat_err[e, t] = max(feat_err[e, t], np.abs(obs[e, i] - fx[e][i](rust_obs[e][i])).max())
 
     compare(0, rust)
     for t in range(ticks):

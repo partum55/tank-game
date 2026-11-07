@@ -14,16 +14,14 @@ import numpy as np
 import torch
 
 from .gpu_arena import DRAW_TIE, DRAW_TIMEOUT, GpuArena, MapBank, T1_WIN, T2_WIN, wrap, PI
-from .gru_policy import OPTIONAL_KEYS, PARAM_KEYS
-from .selfplay_env import DRAW_EXTRA_PENALTY, GAMMA, LIVING_BONUS_IN_ENGINE, TIME_PENALTY, AIM_WEIGHT, DIST_WEIGHT
+from .gru_policy import FEATURE_DIM, MOVE_NOISE_SCALE, OPTIONAL_KEYS, PARAM_KEYS
+from .selfplay_env import DRAW_EXTRA_PENALTY, GAMMA, LIVING_BONUS_IN_ENGINE, STUCK_PENALTY, TIME_PENALTY, AIM_WEIGHT, DIST_WEIGHT
 
 BOT_TARGET_DIST = 0.25
 
 
-def potential(angle_to, dist, body, turret):
-    err = turret - (body + angle_to)
-    aim_error = torch.atan2(torch.sin(err), torch.cos(err)).abs() / PI
-    return -(AIM_WEIGHT * aim_error + DIST_WEIGHT * dist)
+def potential(lead_err, dist):
+    return -(AIM_WEIGHT * lead_err.abs() / PI + DIST_WEIGHT * dist)
 
 
 def bot_action(dist, angle_to, turret, body, visible, lidar):
@@ -62,12 +60,14 @@ class GpuSelfPlayEnv:
     # ---------------------------------------------------------------- hall of fame on stage
     def _put(self, slot, params):
         t = {k: torch.as_tensor(np.asarray(params[k], np.float32), device=self.device) for k in PARAM_KEYS}
+        if t["w_in"].shape[1] != FEATURE_DIM:
+            raise ValueError(f"opponent snapshot has {t['w_in'].shape[1]} inputs, the arena provides {FEATURE_DIM}: use a fresh hall of fame")
         if self.slot_w is None:
             self.slot_w = {k: v.unsqueeze(0).repeat(self.S, *[1] * v.dim()).clone() for k, v in t.items()}
         for k, v in t.items():
             self.slot_w[k][slot] = v
         has = "log_std" in params
-        self.slot_std[slot] = torch.exp(torch.as_tensor(np.asarray(params["log_std"], np.float32), device=self.device)) if has else 0.0
+        self.slot_std[slot] = MOVE_NOISE_SCALE * torch.exp(torch.as_tensor(np.asarray(params["log_std"], np.float32), device=self.device)) if has else 0.0
         self.slot_stoch[slot] = has
 
     def set_pool(self, pool):
@@ -105,7 +105,7 @@ class GpuSelfPlayEnv:
 
     def _phi(self, ob):
         g = lambda t: self._pick_obs(t, self.side)
-        return potential(g(ob.angle_to), g(ob.dist), g(ob.body), g(ob.turret))
+        return potential(g(ob.lead_err), g(ob.dist))
 
     # ---------------------------------------------------------------- opponents
     def _opp_action(self, ob):
@@ -139,7 +139,7 @@ class GpuSelfPlayEnv:
 
     # ---------------------------------------------------------------- step
     def step(self, act):
-        """act (E,4): learner action (move in [-1,1], shoot +-1). Returns (obs (E,27), reward (E,), done (E,))."""
+        """act (E,4): learner action (move in [-1,1], shoot +-1). Returns (obs (E,31), reward (E,), done (E,))."""
         opp_act = self._opp_action(self.ob)
         mine0 = (self.side == 0).unsqueeze(1)
         both = torch.stack([torch.where(mine0, act, opp_act), torch.where(mine0, opp_act, act)], 1)
@@ -147,7 +147,9 @@ class GpuSelfPlayEnv:
 
         post = self.arena.observe(lidar=False)  # enough for the shaping potential
         phi = self._phi(post)
-        reward = self._pick_obs(r_eng, self.side) - LIVING_BONUS_IN_ENGINE - TIME_PENALTY + GAMMA * phi - self.phi
+        stuck = self._pick_obs(self.arena.blocked_move.float(), self.side)
+        reward = (self._pick_obs(r_eng, self.side) - LIVING_BONUS_IN_ENGINE - TIME_PENALTY - STUCK_PENALTY * stuck
+                  + GAMMA * phi - self.phi)
         draw = (outcome == DRAW_TIE) | (outcome == DRAW_TIMEOUT)
         reward = reward - DRAW_EXTRA_PENALTY * draw
 

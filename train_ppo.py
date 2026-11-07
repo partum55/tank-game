@@ -40,7 +40,7 @@ LOG2PI = math.log(2.0 * math.pi)
 class Net(nn.Module):
     """obs -> tanh(Linear) -> GRU -> actor (3 move means + shoot logit) and critic (value)."""
 
-    def __init__(self, in_dim=27, emb=256, hidden=256):
+    def __init__(self, in_dim=FEATURE_DIM, emb=256, hidden=256):
         super().__init__()
         self.hidden = hidden
         self.inp = nn.Linear(in_dim, emb)
@@ -143,10 +143,10 @@ def write_export(folder: str, params: dict):
 def self_check(emb=32, hidden=32, T=40, B=3) -> float:
     """The exported NumPy policy must reproduce the torch network (including resets). Returns max |diff|."""
     torch.manual_seed(0)
-    net = Net(27, emb, hidden)
+    net = Net(FEATURE_DIM, emb, hidden)
     for p in net.parameters():  # make it non-trivial
         p.data += 0.2 * torch.randn_like(p)
-    x = torch.randn(T, B, 27)
+    x = torch.randn(T, B, FEATURE_DIM)
     first = (torch.rand(T, B) < 0.1).float()
     first[0] = 1.0
     with torch.no_grad():
@@ -204,7 +204,7 @@ def autotune_envs(bank, device, hidden, slots, max_envs, floor=1024, gain=1.15):
     from mytrain.gru_policy import random_params
 
     sync = torch.cuda.synchronize if device.type == "cuda" else (lambda: None)
-    pool = [random_params(27, hidden, hidden, 0)]
+    pool = [random_params(FEATURE_DIM, hidden, hidden, 0)]
     results, e = [], floor
     while e <= max_envs:
         try:

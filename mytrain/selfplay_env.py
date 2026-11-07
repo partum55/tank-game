@@ -22,22 +22,21 @@ import numpy as np
 
 from tank_env import OFFICIAL_MAX_STEPS, RuleBasedBot, TankEnvironment
 
-from .gru_policy import NumpyGRUPolicy, features
+from .gru_policy import FeatureExtractor, NumpyGRUPolicy
 
 GAMMA = 0.997            # must match the PPO discount (potential-based shaping)
 TIME_PENALTY = 0.02
 DRAW_EXTRA_PENALTY = 40.0
 LIVING_BONUS_IN_ENGINE = 0.01
 AIM_WEIGHT = 3.0
+STUCK_PENALTY = 0.05      # per tick of driving into a wall / tank (GPU arena only: it sees the collisions)
 DIST_WEIGHT = 3.0
 TRAIN_SEED_LIMIT = 5_000_000   # evaluation seeds live far above this (referee: 1000.., trainer: 10_000_000..)
 
 
-def potential(obs: dict) -> float:
-    """Higher = closer to the (last known) enemy and aiming at it."""
-    err = obs["turret_angle"] - (obs["body_angle"] + obs["enemy_angle_to"])
-    aim_error = abs(math.atan2(math.sin(err), math.cos(err))) / math.pi  # 0 aimed .. 1 backwards
-    return -(AIM_WEIGHT * aim_error + DIST_WEIGHT * obs["enemy_dist"])
+def potential(lead_err: float, dist: float) -> float:
+    """Higher = closer to the (last known) enemy and aiming where a bullet would meet it (lead point, not its current position)."""
+    return -(AIM_WEIGHT * abs(lead_err) / math.pi + DIST_WEIGHT * dist)
 
 
 def shaped_reward(engine_reward: float, outcome: str, phi_before: float, phi_after: float, done: bool) -> float:
@@ -54,6 +53,7 @@ class _Slot:
     def __init__(self, rng: random.Random, pool: list, bot_prob: float, latest_prob: float, max_steps: int):
         self.rng, self.bot_prob, self.latest_prob = rng, bot_prob, latest_prob
         self.env = TankEnvironment(max_steps=max_steps)
+        self.fx = FeatureExtractor()
         self.pool = pool
 
     def reset(self):
@@ -68,8 +68,10 @@ class _Slot:
                 params = self.rng.choice(self.pool)
             self.opp, self.opp_kind = NumpyGRUPolicy(params), "hof"
         self.obs = (o1, o2)
-        self.phi = potential(self.obs[self.side])
-        return features(self.obs[self.side])
+        self.fx.reset()
+        feat = self.fx(self.obs[self.side])
+        self.phi = potential(self.fx.lead_err, self.obs[self.side]["enemy_dist"])
+        return feat
 
     def step(self, learner_action):
         opp_action = self.opp.act(self.obs[1 - self.side])
@@ -77,7 +79,8 @@ class _Slot:
         o1, o2, rewards, done, info = self.env.step(*a)
         self.obs = (o1, o2)
         mine = self.obs[self.side]
-        phi = potential(mine)
+        feat = self.fx(mine)
+        phi = potential(self.fx.lead_err, mine["enemy_dist"])
         reward = shaped_reward(rewards[self.side], info["outcome"], self.phi, phi, done)
         episode = None
         if done:
@@ -87,7 +90,6 @@ class _Slot:
             feat = self.reset()
         else:
             self.phi = phi
-            feat = features(mine)
         return feat, reward, done, episode
 
 

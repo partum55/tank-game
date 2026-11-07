@@ -126,3 +126,14 @@ Expected: the ~37 ms/step launch overhead collapses, so rollouts get several tim
 hall-of-fame snapshot in the bundle (plus the rule-based bot and any `--extra` policies) on the Rust engine, in parallel, and writes the
 highest-ranked one as a ready-to-duel agent folder. Training's own `export_best` is picked from 12-24 games and can be a lucky one; this
 tournament is the better selector. Exports without `log_std` (older bundles) are flagged because they play deterministically.
+
+## v2 inputs and reward (31 features)
+Observed on the first strong agent: it hugged walls, shot at where the enemy *was*, and moved jerkily. Causes and fixes:
+- **No lead**: the model had no enemy velocity (and the GRU never inferred it). Now `FeatureExtractor` (stateful) adds the enemy velocity
+  (change of its position between two consecutive visible ticks, in the own-heading frame) and sin/cos of the aim error to the lead point
+  (`lead_angle_error`: bullet intercept, law of sines). The GPU arena computes the same (`tests/test_gpu_parity.py` replays Rust games and
+  compares all 31 inputs). Exports with 27 inputs still load (`FeatureExtractor(27)`).
+- **Wall hugging**: the distance shaping pulls towards the (last known) enemy through walls. Added `STUCK_PENALTY` (0.05 per tick of driving
+  into something: commanded speed > 1 px/tick but moved < 30% of it; GPU arena only) and the aim shaping now uses the lead error.
+- **Jitter**: ablation on the first agent: moves need no exploration noise (0.86 exact, 0.91 with 0.25, 0.83 with the full 0.5); only the
+  *shot* must stay sampled (its probability sat at ~0.45 on every tick). So moves are played with `MOVE_NOISE_SCALE` (0.5) x exp(log_std).

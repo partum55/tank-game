@@ -14,7 +14,7 @@ import time
 import torch
 
 ARENA_STATE = ("rects", "pos", "vel", "body", "turret", "speed", "hp", "alive", "cooldown", "steps", "bpos", "bvel", "bowner",
-               "bactive", "mem_pos", "mem_turret", "mem_hp", "mem_unseen", "blocked")
+               "bactive", "mem_pos", "mem_turret", "mem_hp", "mem_unseen", "blocked", "prev_en", "prev_vis", "blocked_move")
 ENV_STATE = ("side", "opp", "opp_h", "phi", "stats")
 
 
@@ -36,7 +36,7 @@ def static_env_step(env, act):
 
 
 class Rollout:
-    def __init__(self, net, env, T, hidden, device, reward_scale, feature_dim=27, graph=False, static_env=False):
+    def __init__(self, net, env, T, hidden, device, reward_scale, feature_dim=31, graph=False, static_env=False):
         self.net, self.env, self.T, self.device, self.scale = net, env, T, device, reward_scale
         self.static_env = graph or static_env
         N = env.E if hasattr(env, "E") else env.vec.num_envs

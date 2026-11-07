@@ -8,7 +8,7 @@ torch = pytest.importorskip("torch")
 import train_ppo
 from mytrain.gpu_arena import MapBank
 from mytrain.gpu_selfplay import GpuSelfPlayEnv
-from mytrain.gru_policy import random_params
+from mytrain.gru_policy import FEATURE_DIM, random_params
 from mytrain.mapmix import build_mix
 from mytrain.rollout import Rollout
 
@@ -18,9 +18,9 @@ def make(static, seed=0, E=24, T=20):
     torch.manual_seed(seed)
     bank = MapBank.from_rust(list(range(10)), "cpu", build_mix(10, 1))
     env = GpuSelfPlayEnv(E, bank, "cpu", 16, slots=2, bot_prob=0.3, max_steps=15)  # short episodes: resets happen inside the rollout
-    pool = [dict(random_params(27, 16, 16, s), log_std=np.full(3, -0.7, np.float32)) for s in (1, 2)]
+    pool = [dict(random_params(FEATURE_DIM, 16, 16, s), log_std=np.full(3, -0.7, np.float32)) for s in (1, 2)]
     env.set_pool(pool)
-    net = train_ppo.Net(27, 16, 16)
+    net = train_ppo.Net(FEATURE_DIM, 16, 16)
     torch.manual_seed(seed + 100)
     return Rollout(net, env, T, 16, torch.device("cpu"), 0.05, static_env=static), env
 
@@ -61,8 +61,8 @@ def test_graph_request_falls_back_cleanly_without_cuda():
     torch.manual_seed(0)
     bank = MapBank.from_rust(list(range(5)), "cpu")
     env = GpuSelfPlayEnv(8, bank, "cpu", 16, slots=1)
-    env.set_pool([random_params(27, 16, 16, 1)])
-    ro = Rollout(train_ppo.Net(27, 16, 16), env, 8, 16, torch.device("cpu"), 0.05, graph=True)
+    env.set_pool([random_params(FEATURE_DIM, 16, 16, 1)])
+    ro = Rollout(train_ppo.Net(FEATURE_DIM, 16, 16), env, 8, 16, torch.device("cpu"), 0.05, graph=True)
     assert ro.graph is None and "OFF" in ro.graph_note and not ro.static_env
     ro.run()
     assert int(ro.t) == 8 and torch.isfinite(ro.obs_buf).all()
