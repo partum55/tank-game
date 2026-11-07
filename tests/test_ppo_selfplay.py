@@ -142,3 +142,29 @@ def test_bundle_contains_what_a_reviewer_needs(tmp_path):
     cfg = json.load(open(os.path.join(out, "config.json")))
     assert cfg["rules_version"] and len(cfg["runs"]) == 2
     assert load_agent(os.path.join(out, "export_best", "agent.py")).act({})  # the bundled agent runs
+
+
+def test_fused_unroll_matches_the_step_by_step_reference():
+    torch = pytest.importorskip("torch")
+    import train_ppo
+
+    torch.manual_seed(1)
+    net = train_ppo.Net(27, 16, 16)
+    for p in net.parameters():
+        p.data += 0.2 * torch.randn_like(p)
+    T, B = 30, 7
+    x = torch.randn(T, B, 27)
+    h0 = torch.randn(B, 16)
+    first = (torch.rand(T, B) < 0.08).float()
+    first[0, :3] = 1.0          # window opens an episode for some envs only
+    first[:, 6] = 0.0           # an env with no reset at all
+    first[5, 5] = first[6, 5] = 1.0  # back-to-back resets
+    results = []
+    for fn in (net.unroll_reference, net.unroll):
+        net.zero_grad()
+        out, val = fn(x, h0, first)
+        (out.pow(2).sum() + val.pow(2).sum()).backward()
+        results.append((out.detach(), val.detach(), [p.grad.clone() for p in net.parameters() if p.grad is not None]))
+    (o1, v1, g1), (o2, v2, g2) = results
+    assert torch.allclose(o1, o2, atol=1e-5) and torch.allclose(v1, v2, atol=1e-5)
+    assert all(torch.allclose(a, b, atol=1e-4) for a, b in zip(g1, g2))

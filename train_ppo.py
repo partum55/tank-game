@@ -57,14 +57,34 @@ class Net(nn.Module):
         h_new = out.squeeze(0)
         return self.actor(h_new), self.critic(h_new).squeeze(1), h_new
 
-    def unroll(self, x, h, first):
-        """x (T,B,in), first (T,B) -> raw outputs (T,B,4), values (T,B)."""
+    def unroll_reference(self, x, h, first):
+        """Plain step-by-step unroll (slow, obviously correct). Kept to test `unroll` against."""
         outs, vals = [], []
         for t in range(x.shape[0]):
             o, v, h = self.step(x[t], h, first[t])
             outs.append(o)
             vals.append(v)
         return torch.stack(outs), torch.stack(vals)
+
+    def unroll(self, x, h, first):
+        """
+        x (T,B,in), first (T,B) -> raw outputs (T,B,4), values (T,B). Same result as `unroll_reference`,
+        but a few fused GRU calls instead of T tiny ones (the update was launch-bound): the window is cut
+        only at steps where some env opens a new episode (its memory is wiped there); between cuts the
+        whole batch runs as ONE nn.GRU call.
+        """
+        T = first.shape[0]
+        e = torch.tanh(self.inp(x))                                       # (T,B,E)
+        cuts = [0] + (first[1:].sum(1) > 0).nonzero().flatten().add(1).tolist() + [T]
+        outs = []
+        for i in range(len(cuts) - 1):
+            s, t = cuts[i], cuts[i + 1]
+            h = h * (1.0 - first[s]).unsqueeze(1)                         # wipe memory of envs starting an episode at s
+            out, hn = self.gru(e[s:t], h.unsqueeze(0))
+            h = hn[0]
+            outs.append(out)
+        hs = torch.cat(outs)
+        return self.actor(hs), self.critic(hs).squeeze(-1)
 
     def logp_entropy(self, out, move_raw, shoot):
         mu, logits = out[..., :3], out[..., 3]
