@@ -96,6 +96,35 @@ class Net(nn.Module):
         return logp_move + logp_shoot, ent_move + ent_shoot
 
 
+class CpuEnv:
+    """Rust engine in worker processes, wrapped to the same tensor interface as GpuSelfPlayEnv."""
+
+    def __init__(self, vec, device):
+        self.vec, self.device, self.eps = vec, device, []
+
+    def reset(self):
+        return torch.as_tensor(self.vec.reset(), device=self.device)
+
+    def set_pool(self, pool):
+        self.vec.set_pool(pool)
+
+    def step(self, act):
+        nxt, rew, done, eps = self.vec.step(act.cpu().numpy())
+        self.eps += eps
+        t = lambda a: torch.as_tensor(a, device=self.device)
+        return t(nxt), t(rew), t(done)
+
+    def pop_stats(self):
+        e, self.eps = self.eps, []
+        bot = [x for x in e if x["opp"] == "bot"]
+        return dict(n=len(e), len=sum(x["steps"] for x in e), win=sum(x["result"] == "win" for x in e),
+                    loss=sum(x["result"] == "loss" for x in e), draw=sum(x["result"] == "draw" for x in e),
+                    bot_n=len(bot), bot_win=sum(x["result"] == "win" for x in bot))
+
+    def close(self):
+        self.vec.close()
+
+
 def export_params(net: Net) -> dict:
     """torch -> NumpyGRUPolicy layout (value head and log_std stay in the trainer)."""
     sd = {k: v.detach().cpu().numpy().copy() for k, v in net.state_dict().items()}
@@ -151,6 +180,12 @@ def main():
     ap.add_argument("--save-dir", default="runs/ppo")
     ap.add_argument("--steps", type=float, default=50e6, help="total environment steps (learner side)")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
+    ap.add_argument("--env", choices=["auto", "cpu", "gpu"], default="auto",
+                    help="where the arenas run: gpu = tensor re-implementation of the arena (thousands of envs, no CPU "
+                         "bottleneck); cpu = the Rust engine in worker processes; auto = gpu if CUDA is available")
+    ap.add_argument("--gpu-envs", type=int, default=2048, help="parallel arenas for --env gpu")
+    ap.add_argument("--slots", type=int, default=6, help="hall-of-fame snapshots on stage at once (--env gpu)")
+    ap.add_argument("--map-bank", type=int, default=20000, help="Rust-generated maps for --env gpu")
     ap.add_argument("--target-envs", type=int, default=176,
                     help="total arenas; the same PPO batch on any machine (spread over the workers)")
     ap.add_argument("--envs-per-worker", type=int, default=0, help="0 = auto: ceil(target-envs / workers)")
@@ -158,7 +193,7 @@ def main():
     ap.add_argument("--hidden", type=int, default=256)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--epochs", type=int, default=4)
-    ap.add_argument("--minibatches", type=int, default=4, help="env chunks per epoch (sequences stay whole)")
+    ap.add_argument("--minibatches", type=int, default=0, help="env chunks per epoch (sequences stay whole); 0 = auto: 4 (CPU env) / 8 (GPU env)")
     ap.add_argument("--clip", type=float, default=0.2)
     ap.add_argument("--ent-coef", type=float, default=0.003)
     ap.add_argument("--vf-coef", type=float, default=0.5)
@@ -166,11 +201,11 @@ def main():
     ap.add_argument("--reward-scale", type=float, default=0.05)
     ap.add_argument("--bot-prob", type=float, default=0.2, help="share of episodes against the rule-based anchor")
     ap.add_argument("--latest-prob", type=float, default=0.35, help="share of hall-of-fame games against the 2 newest snapshots")
-    ap.add_argument("--snapshot-every", type=int, default=10, help="updates between hall-of-fame snapshots")
+    ap.add_argument("--snapshot-every", type=int, default=0, help="updates between hall-of-fame snapshots; 0 = auto (10 CPU env / 2 GPU env)")
     ap.add_argument("--hof-size", type=int, default=30)
-    ap.add_argument("--eval-every", type=int, default=20)
+    ap.add_argument("--eval-every", type=int, default=0, help="updates between evaluations on fixed maps; 0 = auto (20 CPU env / 8 GPU env)")
     ap.add_argument("--eval-maps", type=int, default=6)
-    ap.add_argument("--save-every", type=int, default=10)
+    ap.add_argument("--save-every", type=int, default=0, help="updates between full checkpoints (last.pt); 0 = auto (10 CPU env / 4 GPU env)")
     ap.add_argument("--torch-threads", type=int, default=2)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--resume", action="store_true")
@@ -189,8 +224,13 @@ def main():
     net = Net(FEATURE_DIM, args.hidden, args.hidden).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=args.lr, eps=1e-5)
 
+    use_gpu = args.env == "gpu" or (args.env == "auto" and device.type == "cuda")
+    args.minibatches = args.minibatches or (8 if use_gpu else 4)
+    args.snapshot_every = args.snapshot_every or (2 if use_gpu else 10)
+    args.eval_every = args.eval_every or (8 if use_gpu else 20)
+    args.save_every = args.save_every or (4 if use_gpu else 10)
     args.envs_per_worker = args.envs_per_worker or max(1, math.ceil(args.target_envs / args.workers))
-    N, T = args.workers * args.envs_per_worker, args.rollout
+    N, T = (args.gpu_envs if use_gpu else args.workers * args.envs_per_worker), args.rollout
     total_updates = args.updates or max(1, int(args.steps // (N * T)))
     update0, steps_done, best_score = 0, 0, -1.0
     hof = [export_params(net)]  # update 0: an untrained snapshot, so the very first games are easy
@@ -200,18 +240,29 @@ def main():
         net.load_state_dict(ck["net"]), opt.load_state_dict(ck["opt"])
         update0, steps_done, best_score, hof = ck["update"], ck["steps"], ck["best"], ck["hof"]
         print(f"resumed from update {update0} ({steps_done:,} steps, hof={len(hof)})")
+        if not args.updates:  # the batch size may differ from the run that wrote the checkpoint: count what is left in steps
+            total_updates = update0 + max(0, math.ceil((args.steps - steps_done) / (N * T)))
 
-    print(f"device={device} envs={N} ({args.workers}x{args.envs_per_worker}) rollout={T} "
+    layout = "GPU arena" if use_gpu else f"Rust x {args.workers}x{args.envs_per_worker}"
+    print(f"device={device} envs={N} ({layout}) rollout={T} "
           f"batch={N * T:,}/update updates={total_updates} params={sum(p.numel() for p in net.parameters()):,}")
     write_config(args.save_dir, args, dict(device=str(device), num_envs=N, total_updates=total_updates,
                                            params=sum(p.numel() for p in net.parameters())))
-    env = SelfPlayVecEnv(args.workers, args.envs_per_worker, args.seed, args.bot_prob, args.latest_prob)
+    if use_gpu:
+        from mytrain.gpu_arena import MapBank
+        from mytrain.gpu_selfplay import GpuSelfPlayEnv
+
+        seeds = random.Random(args.seed).sample(range(5_000_000), args.map_bank)  # training maps: seeds < 5M
+        print(f"building {args.map_bank} Rust maps for the GPU arena ...", flush=True)
+        env = GpuSelfPlayEnv(N, MapBank.from_rust(seeds, device), device, args.hidden, args.slots, args.bot_prob)
+    else:
+        env = CpuEnv(SelfPlayVecEnv(args.workers, args.envs_per_worker, args.seed, args.bot_prob, args.latest_prob), device)
     env.set_pool(hof)
 
-    obs = torch.as_tensor(env.reset(), device=device)
+    obs = env.reset()
     h = torch.zeros(N, args.hidden, device=device)
     first = torch.ones(N, device=device)
-    recent = collections.deque(maxlen=400)
+    window = collections.deque(maxlen=4)  # episode stats of the last updates
     B_obs = torch.zeros(T, N, FEATURE_DIM, device=device)
     B_first, B_shoot, B_logp, B_val, B_rew, B_done = (torch.zeros(T, N, device=device) for _ in range(6))
     B_move = torch.zeros(T, N, 3, device=device)
@@ -229,13 +280,13 @@ def main():
                     move = out[:, :3] + std * torch.randn_like(out[:, :3])
                     shoot = torch.bernoulli(torch.sigmoid(out[:, 3]))
                     logp, _ = net.logp_entropy(out, move, shoot)
-                act = torch.cat([move.clamp(-1, 1), (shoot * 2 - 1).unsqueeze(1)], dim=1).cpu().numpy()
-                nxt, rew, done, episodes = env.step(act)
+                act = torch.cat([move.clamp(-1, 1), (shoot * 2 - 1).unsqueeze(1)], dim=1)
+                nxt, rew, done = env.step(act)
                 B_move[t], B_shoot[t], B_logp[t], B_val[t] = move, shoot, logp, val
-                B_rew[t] = torch.as_tensor(rew, device=device) * args.reward_scale
-                B_done[t] = torch.as_tensor(done, device=device)
-                obs, first = torch.as_tensor(nxt, device=device), B_done[t]
-                recent.extend(episodes)
+                B_rew[t] = rew * args.reward_scale
+                B_done[t] = done
+                obs, first = nxt, done
+            window.append(env.pop_stats())
             steps_done += N * T
             t_roll = time.time() - t0
             # ---------------- GAE ----------------
@@ -292,20 +343,24 @@ def main():
                 torch.save(dict(net=net.state_dict(), opt=opt.state_dict(), update=update, steps=steps_done,
                                 best=best_score, hof=hof), last_path)
 
+            tot = lambda key: sum(w[key] for w in window)
+
             def rate(kind, res):
-                ep = [e for e in recent if kind in ("all", e["opp"])]
-                return sum(e["result"] == res for e in ep) / len(ep) if ep else float("nan")
+                n, k = (tot("n"), tot(res)) if kind == "all" else (tot("bot_n"), tot("bot_win"))
+                return k / n if n else float("nan")
+
+            ep_len = tot("len") / tot("n") if tot("n") else 0.0
 
             dt = time.time() - t0
             print(f"upd {update:5d}/{total_updates} | {steps_done / 1e6:6.2f}M steps | {N * T / dt:7.0f} sps | "
                   f"win {rate('all', 'win'):.2f} loss {rate('all', 'loss'):.2f} draw {rate('all', 'draw'):.2f} "
-                  f"(bot win {rate('bot', 'win'):.2f}) | ep_len {np.mean([e['steps'] for e in recent]) if recent else 0:5.0f} "
+                  f"(bot win {rate('bot', 'win'):.2f}) | ep_len {ep_len:5.0f} "
                   f"| pg {np.mean(stats['pg']):+.3f} v {np.mean(stats['v']):.3f} ent {np.mean(stats['ent']):.2f} "
                   f"kl {np.mean(stats['kl']):.4f} | roll {t_roll:.1f}s upd {dt - t_roll:.1f}s{line}", flush=True)
             append_metrics(args.save_dir, dict(
                 update=update, steps=steps_done, sps=round(N * T / dt), win=rate('all', 'win'), loss=rate('all', 'loss'),
                 draw=rate('all', 'draw'), bot_win=rate('bot', 'win'),
-                ep_len=np.mean([e['steps'] for e in recent]) if recent else "",
+                ep_len=ep_len if tot('n') else "",
                 pg=np.mean(stats['pg']), v=np.mean(stats['v']), ent=np.mean(stats['ent']), kl=np.mean(stats['kl']),
                 eval_vs_bot=ev_bot, eval_vs_old=ev_old, time=round(time.time())))
             if ev_bot != "":
