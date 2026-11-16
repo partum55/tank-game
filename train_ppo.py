@@ -291,7 +291,11 @@ def main():
     ap.add_argument("--eval-procs", type=int, default=max(1, (os.cpu_count() or 2) - 1),
                     help="CPU processes for the Rust-engine evaluation (1 = in the trainer process)")
     ap.add_argument("--eval-maps", type=int, default=12, help="fixed maps per evaluation (x2 sides); few maps make the *best* pick a coin flip")
-    ap.add_argument("--save-every", type=int, default=0, help="updates between full checkpoints (last.pt); 0 = auto (10 CPU env / 4 GPU env)")
+    ap.add_argument("--save-every", type=int, default=0, help="updates between full checkpoints (last.pt); 0 = auto (10 CPU env / 4 GPU env); "
+                                                                "ignored when --save-minutes is set")
+    ap.add_argument("--save-minutes", type=float, default=10.0,
+                    help="minutes between full checkpoints (last.pt holds the net, the optimizer and the whole hall of fame: ~100+ MB written to "
+                         "Drive, which stole a lot of time when it was saved every few updates). A disconnect loses at most this much. 0 = use --save-every")
     ap.add_argument("--torch-threads", type=int, default=2)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--resume", action="store_true")
@@ -353,6 +357,7 @@ def main():
     total_updates = args.updates or max(1, int(args.steps // (N * T)))
     update0, steps_done, best_score = 0, 0, -1.0
     seconds_before, t_start = 0.0, time.time()    # training time of earlier sessions (from the checkpoint) / start of this session
+    t_saved = t_start                              # last full checkpoint (--save-minutes)
     hof = [export_params(net)]  # update 0: an untrained snapshot, so the very first games are easy
     pinned = []                 # every new *best* export stays an opponent for good (guards against forgetting / cycling)
     last_path = os.path.join(args.save_dir, "last.pt")
@@ -443,7 +448,8 @@ def main():
                 hof.append(export_params(net))
                 if len(hof) > args.hof_size:
                     del hof[random.randrange(0, len(hof) - 4)]  # thin out old ones, keep the newest 4
-                np.savez_compressed(os.path.join(args.save_dir, "hof", f"snap_{update:05d}.npz"), **hof[-1])
+                if (update // args.snapshot_every) % 4 == 0:   # the files only feed the final tournament; the hall of fame itself lives in memory
+                    np.savez_compressed(os.path.join(args.save_dir, "hof", f"snap_{update:05d}.npz"), **hof[-1])
                 env.set_pool(pinned + hof)
             line, ev_bot, ev_old = "", "", ""
             is_last = update >= total_updates or (args.hours > 0 and progress() >= 1.0)    # the time budget is used up
@@ -462,10 +468,14 @@ def main():
                     pinned.append(params)
                     del pinned[:-12]  # at most 12 pinned bests
                     env.set_pool(pinned + hof)
-            if update % args.save_every == 0 or is_last:
+            save_due = (time.time() - t_saved >= args.save_minutes * 60) if args.save_minutes else (update % args.save_every == 0)
+            if save_due or is_last:
+                t_save = time.time()
                 torch.save(dict(net=net.state_dict(), opt=opt.state_dict(), update=update, steps=steps_done,
                                 best=best_score, hof=hof, pinned=pinned, seconds=seconds_before + time.time() - t_start), last_path + ".tmp")
                 os.replace(last_path + ".tmp", last_path)    # a disconnect in the middle of a save must not destroy the last good checkpoint
+                t_saved = time.time()
+                print(f"checkpoint saved in {t_saved - t_save:.1f}s ({os.path.getsize(last_path) / 1e6:.0f} MB)", flush=True)
 
             tot = lambda key: sum(w[key] for w in window)
 
