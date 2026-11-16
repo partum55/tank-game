@@ -245,6 +245,10 @@ def main():
     ap = argparse.ArgumentParser(description="PPO + GRU + hall-of-fame self-play")
     ap.add_argument("--save-dir", default="runs/ppo")
     ap.add_argument("--steps", type=float, default=50e6, help="total environment steps (learner side)")
+    ap.add_argument("--hours", type=float, default=0.0,
+                    help="train for this many hours of wall-clock time instead of --steps (lr decay and the shot-penalty warm-up follow the clock; "
+                         "time already spent is stored in the checkpoint, so --resume after a disconnect continues the same budget). "
+                         "--steps then only sizes the GPU arena count (use roughly the number of steps you expect, e.g. 1500e6 for 10 h on an A100)")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     ap.add_argument("--env", choices=["auto", "cpu", "gpu"], default="auto",
                     help="where the arenas run: gpu = tensor re-implementation of the arena (thousands of envs, no CPU "
@@ -348,6 +352,7 @@ def main():
     args.minibatches = args.minibatches or (max(8, math.ceil(N / 2048)) if use_gpu else 4)
     total_updates = args.updates or max(1, int(args.steps // (N * T)))
     update0, steps_done, best_score = 0, 0, -1.0
+    seconds_before, t_start = 0.0, time.time()    # training time of earlier sessions (from the checkpoint) / start of this session
     hof = [export_params(net)]  # update 0: an untrained snapshot, so the very first games are easy
     pinned = []                 # every new *best* export stays an opponent for good (guards against forgetting / cycling)
     last_path = os.path.join(args.save_dir, "last.pt")
@@ -356,9 +361,16 @@ def main():
         net.load_state_dict(ck["net"]), opt.load_state_dict(ck["opt"])
         update0, steps_done, best_score, hof = ck["update"], ck["steps"], ck["best"], ck["hof"]
         pinned = ck.get("pinned", [])
-        print(f"resumed from update {update0} ({steps_done:,} steps, hof={len(hof)})")
+        seconds_before = ck.get("seconds", 0.0)
+        print(f"resumed from update {update0} ({steps_done:,} steps, hof={len(hof)}, {seconds_before / 3600:.2f} h trained)")
         if not args.updates:  # the batch size may differ from the run that wrote the checkpoint: count what is left in steps
             total_updates = update0 + max(0, math.ceil((args.steps - steps_done) / (N * T)))
+    if args.hours and not args.updates:
+        total_updates = 10 ** 9      # the clock decides when to stop
+
+    def progress() -> float:
+        """0..1 share of the budget used: wall-clock when --hours is set, environment steps otherwise."""
+        return min(1.0, (seconds_before + time.time() - t_start) / (args.hours * 3600.0)) if args.hours else min(1.0, steps_done / args.steps)
 
     layout = "GPU arena" if use_gpu else f"Rust x {args.workers}x{args.envs_per_worker}"
     print(f"device={device} envs={N} ({layout}) rollout={T} "
@@ -382,10 +394,10 @@ def main():
     try:
         for update in range(update0 + 1, total_updates + 1):
             t0 = time.time()
-            lr = args.lr * (1.0 - (1.0 - args.lr_final_frac) * min(1.0, steps_done / args.steps))
+            lr = args.lr * (1.0 - (1.0 - args.lr_final_frac) * progress())
             for group in opt.param_groups:
                 group["lr"] = lr
-            env.set_shot_scale(min(1.0, steps_done / max(1.0, args.shot_penalty_warmup * args.steps)))
+            env.set_shot_scale(min(1.0, progress() / max(1e-9, args.shot_penalty_warmup)))
             h0 = ro.h.clone()
             # ---------------- rollout (T steps; eager or one CUDA-graph launch per step) ----------------
             ro.run()
@@ -434,7 +446,8 @@ def main():
                 np.savez_compressed(os.path.join(args.save_dir, "hof", f"snap_{update:05d}.npz"), **hof[-1])
                 env.set_pool(pinned + hof)
             line, ev_bot, ev_old = "", "", ""
-            if update % args.eval_every == 0 or update == total_updates:
+            is_last = update >= total_updates or (args.hours > 0 and progress() >= 1.0)    # the time budget is used up
+            if update % args.eval_every == 0 or is_last:
                 params = export_params(net)
                 if eval_pool is None and args.eval_procs > 1:
                     eval_pool = EvalPool(args.eval_procs)  # first evaluation: start the worker processes once
@@ -449,9 +462,10 @@ def main():
                     pinned.append(params)
                     del pinned[:-12]  # at most 12 pinned bests
                     env.set_pool(pinned + hof)
-            if update % args.save_every == 0 or update == total_updates:
+            if update % args.save_every == 0 or is_last:
                 torch.save(dict(net=net.state_dict(), opt=opt.state_dict(), update=update, steps=steps_done,
-                                best=best_score, hof=hof, pinned=pinned), last_path)
+                                best=best_score, hof=hof, pinned=pinned, seconds=seconds_before + time.time() - t_start), last_path + ".tmp")
+                os.replace(last_path + ".tmp", last_path)    # a disconnect in the middle of a save must not destroy the last good checkpoint
 
             tot = lambda key: sum(w[key] for w in window)
 
@@ -466,7 +480,8 @@ def main():
 
             dt = time.time() - t0
             vram = f" vram {torch.cuda.max_memory_allocated() / 1e9:.1f}GB" if device.type == "cuda" else ""
-            print(f"upd {update:5d}/{total_updates} | {steps_done / 1e6:6.2f}M steps | {N * T / dt:7.0f} sps | "
+            where = f"{(seconds_before + time.time() - t_start) / 3600:5.2f}/{args.hours:g}h" if args.hours else f"{total_updates}"
+            print(f"upd {update:5d}/{where} | {steps_done / 1e6:6.2f}M steps | {N * T / dt:7.0f} sps | "
                   f"kill {rate('all', 'win'):.2f} died {rate('all', 'loss'):.2f} timeout {rate('all', 'draw'):.2f} "
                   f"(bot kill {rate('bot', 'win'):.2f}) | ep_len {ep_len:5.0f} shots {shots_ep:4.1f} hit {hit_rate:.2f} dry {ammo_out:.2f} "
                   f"| pg {np.mean(stats['pg']):+.3f} v {np.mean(stats['v']):.3f} ent {np.mean(stats['ent']):.2f} "
@@ -479,6 +494,8 @@ def main():
                 eval_vs_bot=ev_bot, eval_vs_old=ev_old, time=round(time.time())))
             if ev_bot != "":
                 make_bundle(args.save_dir)  # always-fresh hand-off folder on Drive
+            if is_last:
+                break
     finally:
         env.close()
         if eval_pool is not None:

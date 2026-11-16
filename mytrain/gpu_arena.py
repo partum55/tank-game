@@ -197,6 +197,7 @@ class GpuArena:
         self.blocked_move = torch.zeros(E, 2, dtype=torch.bool, device=device)   # tank commanded to move but stuck (wall / tank)
         self.ammo = torch.full((E, 2), MAX_AMMO, dtype=torch.long, device=device)
         self.shot_age = torch.full((E, 2), NO_SHOT, dtype=torch.long, device=device)   # ticks since tank i last spawned a bullet
+        self.shot_theta = torch.tensor(SHOT_THETA, device=device)   # built once: a host->device copy inside a captured CUDA graph is not allowed
         # events of the LAST tick, per tank (E,2): shots fired, shots that ended on a wall / the border / a blocked muzzle, hits TAKEN
         self.last_fired, self.last_missed, self.last_hits = f(E, 2), f(E, 2), f(E, 2)
         self.reset(torch.ones(E, dtype=torch.bool, device=device), self.random_maps())
@@ -448,7 +449,7 @@ class GpuArena:
         err = wrap(seen_turret - torch.atan2(me_pos[..., 1] - seen_pos[..., 1], me_pos[..., 0] - seen_pos[..., 0])).abs() / PI
         ready = self.shot_age.flip(1).float().clamp(max=RELOAD_TICKS) / RELOAD_TICKS
         x = torch.stack([torch.ones_like(err), err, ready, dist], -1)
-        return torch.sigmoid(x @ torch.tensor(SHOT_THETA, device=self.device))
+        return torch.sigmoid(x @ self.shot_theta)
 
     @staticmethod
     def _border_t(ox, oy, dx, dy):
