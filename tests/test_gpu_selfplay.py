@@ -67,6 +67,60 @@ def test_in_tensor_gru_opponent_matches_the_numpy_policy():
                 ref[e].reset()
 
 
+class _FixedRng:
+    """Stands in for the CPU slot's random.Random: first call = the map seed, afterwards side 0."""
+
+    def __init__(self, seed):
+        self.seed, self.calls = seed, 0
+
+    def randrange(self, n):
+        self.calls += 1
+        return self.seed if self.calls == 1 else 0
+
+    def random(self):
+        return 0.0
+
+
+def test_cpu_and_gpu_training_rewards_agree_against_the_bot():
+    """The same learner actions against the rule-based bot on the same maps must earn the same reward, tick by tick, on the Rust (CPU)
+    path and on the tensor (GPU) path: blind / off-aim / missed shots, hit streaks, corners, hiding, stuck, kill-only ends."""
+    from mytrain.selfplay_env import _Slot
+
+    seeds, T = list(range(400, 424)), 400
+    E = len(seeds)
+    bank = MapBank.from_rust(seeds, "cpu")
+    env = GpuSelfPlayEnv(E, bank, "cpu", 8, slots=2, bot_prob=1.0, max_steps=T + 50)
+    env.reset()
+    env.arena.reset(torch.ones(E, dtype=torch.bool), torch.arange(E))     # map e = seed e
+    env.side[:] = 0
+    env.opp[:] = env.S                                                      # the opponent is the bot
+    env.ob = env.arena.observe()
+    env.phi = env._phi(env.ob)
+    env.streak.zero_()
+    slots = [_Slot(_FixedRng(s), [], 1.0, 0.0, T + 50) for s in seeds]
+    for s in slots:
+        s.reset()
+    rng = np.random.default_rng(5)
+    acts = np.stack([random_actions(rng, T) for _ in seeds], 1)[:, :, 0]    # (T, E, 4): the learner is tank 1
+    first_diff = np.full(E, T)
+    finished = np.zeros(E, bool)
+    penalised = 0
+    for t in range(T):
+        _, rew_gpu, done_gpu = env.step(torch.as_tensor(acts[t]))
+        for e, s in enumerate(slots):
+            if finished[e]:
+                continue
+            _, rew_cpu, done_cpu, _ = s.step(acts[t, e].tolist())
+            if abs(rew_cpu - float(rew_gpu[e])) > 2e-3 or bool(done_cpu) != bool(done_gpu[e]):
+                first_diff[e] = min(first_diff[e], t)
+            finished[e] = finished[e] or bool(done_cpu) or first_diff[e] < T
+    st = env.pop_stats()
+    print("diverged:", int((first_diff < T).sum()), "of", E, "| shots", st["shots"], "missed", st["missed"], "hits", st["hits"],
+          "| kills", st["win"], "died", st["loss"], "timeouts", st["draw"])
+    assert st["shots"] > 50 and st["missed"] > 0, "the penalties were not exercised"
+    assert (first_diff < T).sum() <= 2, f"CPU and GPU rewards differ in {(first_diff < T).sum()} of {E} games (first ticks: {first_diff})"
+
+
 def test_stats_count_finished_episodes_and_rewards_are_finite():
     bank = MapBank.from_rust(list(range(70, 80)), "cpu")
     env = GpuSelfPlayEnv(32, bank, "cpu", 8, slots=2, bot_prob=0.5, max_steps=40)

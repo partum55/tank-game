@@ -117,12 +117,17 @@ class CpuEnv:
         t = lambda a: torch.as_tensor(a, device=self.device)
         return t(nxt), t(rew), t(done)
 
+    def set_shot_scale(self, scale):
+        self.vec.set_shot_scale(scale)
+
     def pop_stats(self):
         e, self.eps = self.eps, []
         bot = [x for x in e if x["opp"] == "bot"]
         return dict(n=len(e), len=sum(x["steps"] for x in e), win=sum(x["result"] == "win" for x in e),
                     loss=sum(x["result"] == "loss" for x in e), draw=sum(x["result"] == "draw" for x in e),
-                    bot_n=len(bot), bot_win=sum(x["result"] == "win" for x in bot))
+                    bot_n=len(bot), bot_win=sum(x["result"] == "win" for x in bot),
+                    shots=sum(x["fired"] for x in e), hits=sum(x["hits"] for x in e), missed=sum(x["missed"] for x in e),
+                    ammo_out=sum(x["ammo_out"] for x in e))
 
     def close(self):
         self.vec.close()
@@ -164,8 +169,8 @@ def self_check(emb=32, hidden=32, T=40, B=3) -> float:
 
 
 def score(stats: dict, who: str = "A") -> float:
-    s = stats[who]
-    return (s["wins"] + 0.5 * s["draws"]) / max(stats["games"], 1)
+    """Share of won games; a draw (nobody died before the timeout) is worth nothing, as in the training reward."""
+    return stats[who]["wins"] / max(stats["games"], 1)
 
 
 def evaluate(params: dict, hof: list, maps: int, pool=None):
@@ -267,6 +272,9 @@ def main():
     ap.add_argument("--vf-coef", type=float, default=0.5)
     ap.add_argument("--lam", type=float, default=0.95)
     ap.add_argument("--reward-scale", type=float, default=0.05)
+    ap.add_argument("--shot-penalty-warmup", type=float, default=0.1,
+                    help="the bad-shot penalties (blind / off-aim / missed bullet) grow linearly from 0 to full over this share of --steps, "
+                         "so a fresh, almost random net does not learn 'never shoot'")
     ap.add_argument("--bot-prob", type=float, default=0.2, help="share of episodes against the rule-based anchor")
     ap.add_argument("--latest-prob", type=float, default=0.35, help="share of hall-of-fame games against the 2 newest snapshots")
     ap.add_argument("--snapshot-every", type=int, default=0, help="updates between hall-of-fame snapshots; 0 = auto (10 CPU env / 2 GPU env)")
@@ -377,6 +385,7 @@ def main():
             lr = args.lr * (1.0 - (1.0 - args.lr_final_frac) * min(1.0, steps_done / args.steps))
             for group in opt.param_groups:
                 group["lr"] = lr
+            env.set_shot_scale(min(1.0, steps_done / max(1.0, args.shot_penalty_warmup * args.steps)))
             h0 = ro.h.clone()
             # ---------------- rollout (T steps; eager or one CUDA-graph launch per step) ----------------
             ro.run()
@@ -451,18 +460,21 @@ def main():
                 return k / n if n else float("nan")
 
             ep_len = tot("len") / tot("n") if tot("n") else 0.0
+            shots_ep = tot("shots") / tot("n") if tot("n") else float("nan")     # shots fired per episode (20 = all the ammo)
+            hit_rate = tot("hits") / tot("shots") if tot("shots") else float("nan")
+            ammo_out = tot("ammo_out") / tot("n") if tot("n") else float("nan")  # share of episodes that ended with an empty magazine and no kill
 
             dt = time.time() - t0
             vram = f" vram {torch.cuda.max_memory_allocated() / 1e9:.1f}GB" if device.type == "cuda" else ""
             print(f"upd {update:5d}/{total_updates} | {steps_done / 1e6:6.2f}M steps | {N * T / dt:7.0f} sps | "
-                  f"win {rate('all', 'win'):.2f} loss {rate('all', 'loss'):.2f} draw {rate('all', 'draw'):.2f} "
-                  f"(bot win {rate('bot', 'win'):.2f}) | ep_len {ep_len:5.0f} "
+                  f"kill {rate('all', 'win'):.2f} died {rate('all', 'loss'):.2f} timeout {rate('all', 'draw'):.2f} "
+                  f"(bot kill {rate('bot', 'win'):.2f}) | ep_len {ep_len:5.0f} shots {shots_ep:4.1f} hit {hit_rate:.2f} dry {ammo_out:.2f} "
                   f"| pg {np.mean(stats['pg']):+.3f} v {np.mean(stats['v']):.3f} ent {np.mean(stats['ent']):.2f} "
                   f"kl {np.mean(stats['kl']):.4f} | roll {t_roll:.1f}s upd {dt - t_roll:.1f}s{vram}{line}", flush=True)
             append_metrics(args.save_dir, dict(
                 update=update, steps=steps_done, sps=round(N * T / dt), win=rate('all', 'win'), loss=rate('all', 'loss'),
                 draw=rate('all', 'draw'), bot_win=rate('bot', 'win'),
-                ep_len=ep_len if tot('n') else "",
+                ep_len=ep_len if tot('n') else "", shots_ep=shots_ep, hit_rate=hit_rate, ammo_out=ammo_out,
                 pg=np.mean(stats['pg']), v=np.mean(stats['v']), ent=np.mean(stats['ent']), kl=np.mean(stats['kl']),
                 eval_vs_bot=ev_bot, eval_vs_old=ev_old, time=round(time.time())))
             if ev_bot != "":

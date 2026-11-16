@@ -5,14 +5,19 @@ Per arena the LEARNER controls one tank (side chosen at random every episode) an
 controls the other: usually a snapshot from the hall of fame, sometimes the rule-based bot as an anchor.
 Opponents run inside the worker (NumPy), so the trainer only batches the learner's observations.
 
-Reward (training only, the arena and referee are untouched) - built to make the agent WANT to win:
-  engine reward   +15 per hit dealt, -10 per hit taken, +-100 win / loss, -10 draw   (kept)
+Reward (training only, the arena and referee are untouched) - built to make the agent WANT to kill:
+  engine reward   +15 per hit dealt, -10 per hit taken                                (kept)
+  end of game     +100 ONLY for killing the enemy; everything else (being killed, timeout - even with more HP -, both dead) is -100.
+                  The engine's own +-100 / -10 are subtracted again (it still pays HP wins at the timeout).
   - living bonus  the engine's +0.01/step is removed
   - time penalty  -0.02 per step, so stalling is never free
-  - draw penalty  extra -40 on a draw / timeout without a decisive result
-  + shaping       gamma*phi(s') - phi(s) with phi = -(aim error + distance to enemy):
-                  potential-based, so it speeds up learning to close in and aim without changing
-                  which policy is optimal. Uses only what the tank can observe (fog included).
+  - bad shots     -1 shot without a visible enemy, -0.5 shot clearly off the lead point (the bullet cannot touch the hull), -1 per bullet
+                  that ends on a wall / the border. Scaled up from 0 during warm-up (shot_scale) so a fresh net does not learn "never shoot".
+  + hit streak    k-th consecutive hit pays +5*(k-1); a missed bullet resets the streak
+  + shaping       gamma*phi(s') - phi(s) with phi = -(aim error + distance to enemy) + 2 * enemy visible:
+                  potential-based, so it speeds up closing in, aiming and FINDING the enemy without changing which policy is optimal.
+                  Uses only what the tank can observe (fog included).
+  - hiding        -0.01 per tick without sight of the enemy, -0.05 per tick in a corner of the arena, -0.05 per tick driving into something
 """
 import math
 import multiprocessing as mp
@@ -26,25 +31,62 @@ from .gru_policy import FeatureExtractor, NumpyGRUPolicy
 
 GAMMA = 0.997            # must match the PPO discount (potential-based shaping)
 TIME_PENALTY = 0.02
-DRAW_EXTRA_PENALTY = 40.0
 LIVING_BONUS_IN_ENGINE = 0.01
+KILL_REWARD, FAIL_REWARD = 100.0, -100.0      # the only win is a kill; every other end of a game is a failure
+ENGINE_END = {"win": 100.0, "loss": -100.0, "draw": -10.0}   # what the engine itself pays at the end (arena result, HP wins included)
 AIM_WEIGHT = 3.0
-STUCK_PENALTY = 0.05      # per tick of driving into a wall / tank (GPU arena only: it sees the collisions)
 DIST_WEIGHT = 3.0
+VIS_WEIGHT = 2.0          # potential bonus for having the enemy in sight (search for him)
+HIDDEN_PENALTY = 0.01     # per tick without sight of the enemy
+CORNER_PENALTY = 0.05     # per tick with the tank centre within CORNER_MARGIN px of two borders
+CORNER_MARGIN = 80.0
+STUCK_PENALTY = 0.05      # per tick of driving into a wall / tank (commanded speed > 1 px/tick but moved < 30% of it)
+SHOT_BLIND = 1.0          # shot while the enemy is not in sight
+SHOT_OFF = 0.5            # shot with the turret so far off the lead point that the bullet cannot touch the enemy hull
+SHOT_MISS = 1.0           # per bullet that ended on a wall / the border (or against a wall at the muzzle)
+STREAK_BONUS = 5.0        # k-th consecutive hit pays STREAK_BONUS * (k - 1)
+HULL_HALF_WIDTH = 13.0    # px, rules v1.2
+ARENA_W, ARENA_H = 1200.0, 800.0
+DIAG = math.hypot(ARENA_W, ARENA_H)
+MAX_SPEED = 4.5
 TRAIN_SEED_LIMIT = 5_000_000   # evaluation seeds live far above this (referee: 1000.., trainer: 10_000_000..)
 
 
-def potential(lead_err: float, dist: float) -> float:
-    """Higher = closer to the (last known) enemy and aiming where a bullet would meet it (lead point, not its current position)."""
-    return -(AIM_WEIGHT * abs(lead_err) / math.pi + DIST_WEIGHT * dist)
+def potential(lead_err: float, dist: float, visible: float = 0.0) -> float:
+    """Higher = closer to the (last known) enemy, aiming where a bullet would meet it (lead point, not its current position),
+    and having him in sight."""
+    return -(AIM_WEIGHT * abs(lead_err) / math.pi + DIST_WEIGHT * dist) + VIS_WEIGHT * visible
 
 
-def shaped_reward(engine_reward: float, outcome: str, phi_before: float, phi_after: float, done: bool) -> float:
+def off_aim(lead_err: float, dist: float) -> bool:
+    """The turret is so far from the lead point that a bullet misses the whole hull (half width HULL_HALF_WIDTH at this distance)."""
+    return abs(lead_err) > math.atan2(HULL_HALF_WIDTH, dist * DIAG)
+
+
+def in_corner(x_px: float, y_px: float) -> bool:
+    return (x_px < CORNER_MARGIN or x_px > ARENA_W - CORNER_MARGIN) and (y_px < CORNER_MARGIN or y_px > ARENA_H - CORNER_MARGIN)
+
+
+def end_reward(killed_enemy: bool) -> float:
+    return KILL_REWARD if killed_enemy else FAIL_REWARD
+
+
+def shaped_reward(engine_reward: float, arena_result, killed: bool, phi_before: float, phi_after: float, done: bool, *,
+                  fired=0, missed=0, blind=False, off=False, hit=0, streak=0, visible=True, corner=False, stuck=False,
+                  shot_scale=1.0):
+    """One tick of the learner's training reward. `arena_result` = the engine's verdict for the learner ('win' / 'loss' / 'draw' / None while the
+    game runs, HP wins at the timeout included), `killed` = the learner is alive and the enemy is dead. Returns (reward, new hit streak)."""
     r = engine_reward - LIVING_BONUS_IN_ENGINE - TIME_PENALTY
     r += GAMMA * phi_after - phi_before
-    if done and outcome.startswith("draw"):
-        r -= DRAW_EXTRA_PENALTY
-    return r
+    if done:
+        r += end_reward(killed) - ENGINE_END.get(arena_result, 0.0)
+    r -= shot_scale * (SHOT_BLIND * (fired and blind) + SHOT_OFF * (fired and off and not blind) + SHOT_MISS * missed)
+    streak = 0 if missed else streak
+    if hit:
+        streak += hit
+        r += STREAK_BONUS * (streak - 1)
+    r -= HIDDEN_PENALTY * (not visible) + CORNER_PENALTY * corner + STUCK_PENALTY * stuck
+    return r, streak
 
 
 class _Slot:
@@ -55,9 +97,12 @@ class _Slot:
         self.env = TankEnvironment(max_steps=max_steps)
         self.fx = FeatureExtractor()
         self.pool = pool
+        self.shot_scale = 1.0   # warm-up factor of the shot penalties (set by the trainer)
 
     def reset(self):
         o1, o2 = self.env.reset(seed=self.rng.randrange(TRAIN_SEED_LIMIT))
+        self.streak = 0
+        self.prev = {"shots_fired": [0, 0], "shots_missed": [0, 0], "hits_dealt": [0, 0]}   # cumulative counters of the last tick
         self.side = self.rng.randrange(2)  # 0: learner is tank 1
         if not self.pool or self.rng.random() < self.bot_prob:
             self.opp, self.opp_kind = RuleBasedBot(), "bot"
@@ -69,8 +114,10 @@ class _Slot:
             self.opp, self.opp_kind = NumpyGRUPolicy(params), "hof"
         self.obs = (o1, o2)
         self.fx.reset()
-        feat = self.fx(self.obs[self.side])
-        self.phi = potential(self.fx.lead_err, self.obs[self.side]["enemy_dist"])
+        mine = self.obs[self.side]
+        feat = self.fx(mine)
+        self.phi = potential(self.fx.lead_err, mine["enemy_dist"], float(mine["enemy_visible"]))
+        self.pos = (mine["x"] * ARENA_W, mine["y"] * ARENA_H)
         return feat
 
     def step(self, learner_action):
@@ -78,15 +125,30 @@ class _Slot:
         a = (learner_action, opp_action) if self.side == 0 else (opp_action, learner_action)
         o1, o2, rewards, done, info = self.env.step(*a)
         self.obs = (o1, o2)
-        mine = self.obs[self.side]
+        s = self.side
+        mine, theirs = self.obs[s], self.obs[1 - s]
         feat = self.fx(mine)
-        phi = potential(self.fx.lead_err, mine["enemy_dist"])
-        reward = shaped_reward(rewards[self.side], info["outcome"], self.phi, phi, done)
+        visible = bool(mine["enemy_visible"])
+        phi = potential(self.fx.lead_err, mine["enemy_dist"], float(visible))
+        delta = {k: info[k][s] - self.prev[k][s] for k in self.prev}                  # events of this tick
+        self.prev = {k: list(info[k]) for k in self.prev}
+        pos = (mine["x"] * ARENA_W, mine["y"] * ARENA_H)
+        speed = abs(mine["speed"]) * MAX_SPEED
+        stuck = mine["hp"] > 0 and speed > 1.0 and math.dist(pos, self.pos) < 0.3 * speed
+        self.pos = pos
+        winner = {"tank1_win": 0, "tank2_win": 1}.get(info["outcome"])
+        arena_result = None if not done else ("draw" if winner is None else ("win" if winner == s else "loss"))
+        killed = bool(done and mine["hp"] > 0 and theirs["hp"] <= 0)
+        reward, self.streak = shaped_reward(
+            rewards[s], arena_result, killed, self.phi, phi, done, fired=delta["shots_fired"], missed=delta["shots_missed"],
+            blind=not visible, off=visible and off_aim(self.fx.lead_err, mine["enemy_dist"]), hit=delta["hits_dealt"],
+            streak=self.streak, visible=visible, corner=in_corner(*pos), stuck=stuck, shot_scale=self.shot_scale)
         episode = None
         if done:
-            winner = {"tank1_win": 0, "tank2_win": 1}.get(info["outcome"])
-            result = "draw" if winner is None else ("win" if winner == self.side else "loss")
-            episode = {"result": result, "opp": self.opp_kind, "steps": info["step"]}
+            died = mine["hp"] <= 0 and theirs["hp"] > 0
+            episode = {"result": "win" if killed else ("loss" if died else "draw"), "opp": self.opp_kind, "steps": info["step"],
+                       "fired": info["shots_fired"][s], "hits": info["hits_dealt"][s], "missed": info["shots_missed"][s],
+                       "ammo_out": bool(info["ammo"][s] == 0 and not killed)}
             feat = self.reset()
         else:
             self.phi = phi
@@ -104,6 +166,10 @@ def _worker(conn, worker_id, n_envs, base_seed, bot_prob, latest_prob, max_steps
             elif cmd == "pool":
                 for s in slots:
                     s.pool = payload
+                conn.send(True)
+            elif cmd == "scale":
+                for s in slots:
+                    s.shot_scale = payload
                 conn.send(True)
             elif cmd == "step":
                 feats, rews, dones, episodes = [], [], [], []
@@ -148,6 +214,10 @@ class SelfPlayVecEnv:
     def set_pool(self, pool: list):
         """Hall of fame: list of parameter dicts (NumpyGRUPolicy format). Empty = bot only."""
         self._all("pool", [pool] * self.n_workers)
+
+    def set_shot_scale(self, scale: float):
+        """Warm-up factor (0..1) of the bad-shot penalties."""
+        self._all("scale", [float(scale)] * self.n_workers)
 
     def step(self, actions: np.ndarray):
         """actions: (num_envs, 4) float, already in env units (move clipped to [-1,1], shoot +-1)."""

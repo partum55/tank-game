@@ -55,7 +55,7 @@ def window(rows, key, lo, hi):
 def duel(a, b, maps: int):
     res = referee.play_series(a, b, range(ASSESS_SEED_BASE, ASSESS_SEED_BASE + maps))
     s = res["A"]
-    return (s["wins"] + 0.5 * s["draws"]) / res["games"], s["wins"], s["losses"], s["draws"]
+    return s["wins"] / res["games"], s["wins"], s["losses"], s["draws"]   # a draw (nobody died) is worth nothing
 
 
 def main():
@@ -110,7 +110,7 @@ def main():
     snaps = sorted(glob.glob(os.path.join(root, "hof", "snap_*.npz")))
     latest = agents.get("export_latest") or agents["export_best"]
 
-    print(f"\n== fresh duels on unseen maps ({args.maps} maps x 2 sides = {args.maps * 2} games each; score = (W + D/2) / games)")
+    print(f"\n== fresh duels on unseen maps ({args.maps} maps x 2 sides = {args.maps * 2} games each; score = games won / games, a draw is worth nothing)")
     bot = RuleBasedBot()
     scores = {}
     for name, ag in agents.items():

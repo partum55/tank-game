@@ -13,15 +13,18 @@ import random
 import numpy as np
 import torch
 
-from .gpu_arena import DRAW_TIE, DRAW_TIMEOUT, GpuArena, MapBank, T1_WIN, T2_WIN, wrap, PI
+from .gpu_arena import DRAW_TIE, DRAW_TIMEOUT, GpuArena, MapBank, T1_WIN, T2_WIN, wrap, PI, W, H
 from .gru_policy import FEATURE_DIM, MOVE_NOISE_SCALE, OPTIONAL_KEYS, PARAM_KEYS
-from .selfplay_env import DRAW_EXTRA_PENALTY, GAMMA, LIVING_BONUS_IN_ENGINE, STUCK_PENALTY, TIME_PENALTY, AIM_WEIGHT, DIST_WEIGHT
+from .selfplay_env import (AIM_WEIGHT, CORNER_MARGIN, CORNER_PENALTY, DIAG, DIST_WEIGHT, ENGINE_END, FAIL_REWARD, GAMMA, HIDDEN_PENALTY,
+                           HULL_HALF_WIDTH, KILL_REWARD, LIVING_BONUS_IN_ENGINE, SHOT_BLIND, SHOT_MISS, SHOT_OFF, STREAK_BONUS,
+                           STUCK_PENALTY, TIME_PENALTY, VIS_WEIGHT)
 
 BOT_TARGET_DIST = 0.25
 
 
-def potential(lead_err, dist):
-    return -(AIM_WEIGHT * lead_err.abs() / PI + DIST_WEIGHT * dist)
+def potential(lead_err, dist, visible):
+    """Tensor twin of selfplay_env.potential."""
+    return -(AIM_WEIGHT * lead_err.abs() / PI + DIST_WEIGHT * dist) + VIS_WEIGHT * visible
 
 
 def bot_action(dist, angle_to, turret, body, visible, lidar):
@@ -54,7 +57,9 @@ class GpuSelfPlayEnv:
         self.opp = z(num_envs, dt=torch.long)   # slot index, S = rule-based bot
         self.opp_h = z(num_envs, hidden)
         self.phi = z(num_envs)
-        self.stats = z(7)
+        self.streak = z(num_envs)                       # consecutive hits of the learner (a missed bullet resets it)
+        self.shot_scale = torch.ones((), device=device)  # warm-up factor of the bad-shot penalties (a tensor: graph-safe)
+        self.stats = z(11)
         self._ar = torch.arange(num_envs, device=device)
 
     # ---------------------------------------------------------------- hall of fame on stage
@@ -89,6 +94,7 @@ class GpuSelfPlayEnv:
         self.side = torch.where(mask, side, self.side)
         self.opp = torch.where(mask, slot, self.opp)
         self.opp_h = torch.where(mask[:, None], torch.zeros_like(self.opp_h), self.opp_h)
+        self.streak = torch.where(mask, torch.zeros_like(self.streak), self.streak)
 
     def _pick_obs(self, tensor, which):
         """tensor (E,2,...) -> (E,...) of the tank `which` (E,)."""
@@ -105,7 +111,10 @@ class GpuSelfPlayEnv:
 
     def _phi(self, ob):
         g = lambda t: self._pick_obs(t, self.side)
-        return potential(g(ob.lead_err), g(ob.dist))
+        return potential(g(ob.lead_err), g(ob.dist), g(ob.visible).float())
+
+    def set_shot_scale(self, scale: float):
+        self.shot_scale.fill_(float(scale))
 
     # ---------------------------------------------------------------- opponents
     def _opp_action(self, ob):
@@ -145,20 +154,46 @@ class GpuSelfPlayEnv:
         both = torch.stack([torch.where(mine0, act, opp_act), torch.where(mine0, opp_act, act)], 1)
         r_eng, done, outcome = self.arena.tick(both)
 
-        post = self.arena.observe(lidar=False)  # enough for the shaping potential
+        a = self.arena
+        post = a.observe(lidar=False)  # enough for the shaping potential
         phi = self._phi(post)
-        stuck = self._pick_obs(self.arena.blocked_move.float(), self.side)
-        reward = (self._pick_obs(r_eng, self.side) - LIVING_BONUS_IN_ENGINE - TIME_PENALTY - STUCK_PENALTY * stuck
-                  + GAMMA * phi - self.phi)
-        draw = (outcome == DRAW_TIE) | (outcome == DRAW_TIMEOUT)
-        reward = reward - DRAW_EXTRA_PENALTY * draw
+        me = lambda t: self._pick_obs(t, self.side)         # the learner's row of an (E,2,...) tensor
+        foe = lambda t: self._pick_obs(t, 1 - self.side)    # the opponent's row
+        stuck = me(a.blocked_move.float())
+        visible = me(post.visible).float()
+        fired, missed, hit = me(a.last_fired), me(a.last_missed), foe(a.last_hits)   # hit = hits the OPPONENT took = the learner's hits
+        blind = fired * (1.0 - visible)
+        dist = me(post.dist)
+        off = fired * visible * (me(post.lead_err).abs() > torch.atan2(torch.full_like(dist, HULL_HALF_WIDTH), dist * DIAG)).float()
+        px, py = me(a.pos[..., 0]), me(a.pos[..., 1])
+        corner = (((px < CORNER_MARGIN) | (px > W - CORNER_MARGIN)) & ((py < CORNER_MARGIN) | (py > H - CORNER_MARGIN))).float()
 
-        win = ((outcome == T1_WIN) & (self.side == 0)) | ((outcome == T2_WIN) & (self.side == 1))
-        loss = done & ~win & ~draw
+        # the end of the game: +100 only for a kill, -100 for everything else; the engine's own +-100 / -10 are taken back out
+        me_alive, foe_alive = me(a.alive), foe(a.alive)
+        killed = done & me_alive & ~foe_alive
+        died = done & ~me_alive & foe_alive
+        draw = done & ~killed & ~died                      # timeout (even with more HP) or both dead
+        win_arena = ((outcome == T1_WIN) & (self.side == 0)) | ((outcome == T2_WIN) & (self.side == 1))
+        lose_arena = ((outcome == T2_WIN) & (self.side == 0)) | ((outcome == T1_WIN) & (self.side == 1))
+        engine_end = ENGINE_END["win"] * win_arena + ENGINE_END["loss"] * lose_arena \
+            + ENGINE_END["draw"] * ((outcome == DRAW_TIE) | (outcome == DRAW_TIMEOUT))
+        end = torch.where(done, torch.where(killed, torch.full_like(phi, KILL_REWARD), torch.full_like(phi, FAIL_REWARD)), torch.zeros_like(phi))
+
+        streak = torch.where(missed > 0, torch.zeros_like(self.streak), self.streak) + hit
+        reward = (me(r_eng) - LIVING_BONUS_IN_ENGINE - TIME_PENALTY + GAMMA * phi - self.phi - engine_end + end
+                  - self.shot_scale * (SHOT_BLIND * blind + SHOT_OFF * off * (1.0 - blind) + SHOT_MISS * missed)
+                  + STREAK_BONUS * (streak - 1.0).clamp_min(0.0) * (hit > 0)
+                  - HIDDEN_PENALTY * (1.0 - visible) - CORNER_PENALTY * corner - STUCK_PENALTY * stuck)
+        self.streak = streak
+
+        win = killed
+        loss = died
         is_bot = self.opp == self.S
         d = done.float()
-        self.stats += torch.stack([d.sum(), (d * self.arena.steps).sum(), (win.float()).sum(), loss.float().sum(),
-                                   draw.float().sum(), (d * is_bot).sum(), ((win & is_bot).float()).sum()])
+        ammo_out = (d * (me(a.ammo) == 0) * (~killed))
+        self.stats += torch.stack([d.sum(), (d * a.steps).sum(), win.float().sum(), loss.float().sum(),
+                                   draw.float().sum(), (d * is_bot).sum(), ((win & is_bot).float()).sum(),
+                                   fired.sum(), hit.sum(), missed.sum(), ammo_out.sum()])
 
         self._pick(done)
         self.arena.reset(done, self.arena.random_maps())
@@ -169,7 +204,8 @@ class GpuSelfPlayEnv:
     def pop_stats(self):
         s = self.stats.cpu().tolist()
         self.stats.zero_()
-        return dict(n=s[0], len=s[1], win=s[2], loss=s[3], draw=s[4], bot_n=s[5], bot_win=s[6])
+        return dict(n=s[0], len=s[1], win=s[2], loss=s[3], draw=s[4], bot_n=s[5], bot_win=s[6],
+                    shots=s[7], hits=s[8], missed=s[9], ammo_out=s[10])
 
     def close(self):
         pass

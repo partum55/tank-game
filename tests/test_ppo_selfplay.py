@@ -7,10 +7,15 @@ import referee
 from tank_env import VectorObservationAdapter, load_agent
 from mytrain.gru_policy import FEATURE_DIM, MOVE_NOISE_SCALE, NumpyGRUPolicy, PARAM_KEYS, FeatureExtractor, lead_angle_error, random_params, write_standalone_agent
 from mytrain.selfplay_env import (
-    DRAW_EXTRA_PENALTY,
     GAMMA,
+    SHOT_BLIND,
+    SHOT_MISS,
+    SHOT_OFF,
+    STREAK_BONUS,
     SelfPlayVecEnv,
     TIME_PENALTY,
+    in_corner,
+    off_aim,
     potential,
     shaped_reward,
 )
@@ -44,16 +49,40 @@ def test_gru_policy_save_load_and_dimension_check(tmp_path):
 def test_reward_is_aggressive_and_potential_based():
     # closer and better aimed (at the lead point) = higher potential
     assert potential(0.0, 0.5) > potential(math.pi, 0.9) and potential(0.0, 0.2) > potential(0.0, 0.5)
-    # standing still with no progress costs time every step (no free stalling)
-    idle = shaped_reward(0.01, "in_progress", -1.0, -1.0, False)  # engine's +0.01 living bonus is removed
+    # having the enemy in sight is worth something (so the agent goes looking for him)
+    assert potential(0.0, 0.5, 1.0) > potential(0.0, 0.5, 0.0)
+    r = lambda *a, **k: shaped_reward(*a, **k)[0]
+    # standing still with no progress costs time every step (no free stalling); the engine's +0.01 living bonus is removed
+    idle = r(0.01, None, False, -1.0, -1.0, False, visible=True)
     assert idle == pytest.approx(-TIME_PENALTY - (GAMMA - 1.0), abs=1e-6) and idle < 0
-    # a timeout draw is clearly worse than the engine's own draw penalty
-    draw = shaped_reward(-10.0, "draw_timeout", -1.0, -1.0, True)
-    no_draw = shaped_reward(-10.0, "in_progress", -1.0, -1.0, True)
-    assert draw == pytest.approx(no_draw - DRAW_EXTRA_PENALTY)
-    # winning beats everything; getting hit costs less than landing a hit gains
-    assert shaped_reward(100.0, "tank1_win", -1, -1, True) > shaped_reward(15.0, "in_progress", -1, -1, False)
-    assert shaped_reward(15.0 - 10.0, "in_progress", -1, -1, False) > 0
+    # the only win is a kill: the engine's HP win at the timeout (+100) becomes -100, a kill stays +100, being killed -100, both dead -100
+    # (engine reward = its living bonus 0.01 + its own end-of-game payment)
+    assert r(0.01 + 100.0, "win", True, -1.0, -1.0, True, visible=True) == pytest.approx(idle + 100.0)          # kill
+    assert r(0.01 + 100.0, "win", False, -1.0, -1.0, True, visible=True) == pytest.approx(idle - 100.0)         # HP win at the timeout
+    assert r(0.01 - 10.0, "draw", False, -1.0, -1.0, True, visible=True) == pytest.approx(idle - 100.0)         # timeout / both dead
+    assert r(0.01 - 100.0, "loss", False, -1.0, -1.0, True, visible=True) == pytest.approx(idle - 100.0)        # killed
+    # a hit gains more than getting hit costs
+    assert r(15.0, None, False, -1, -1, False, visible=True, hit=1) > 0 < r(15.0 - 10.0, None, False, -1, -1, False, visible=True)
+    # bad shots cost (blind > off-aim; both scaled by the warm-up); a good shot costs nothing
+    good = r(0.01, None, False, -1, -1, False, fired=1, visible=True)
+    assert r(0.01, None, False, -1, -1, False, fired=1, blind=True, visible=False) == pytest.approx(good - SHOT_BLIND - 0.01)
+    assert r(0.01, None, False, -1, -1, False, fired=1, off=True, visible=True) == pytest.approx(good - SHOT_OFF)
+    assert r(0.01, None, False, -1, -1, False, fired=1, off=True, visible=True, shot_scale=0.0) == pytest.approx(good)
+    assert r(0.01, None, False, -1, -1, False, missed=2, visible=True) == pytest.approx(good - 2 * SHOT_MISS)
+    # hit streak: 1st hit nothing extra, 2nd +5, 3rd +10; a missed bullet resets it
+    streak = 0
+    gains = []
+    for _ in range(3):
+        rew, streak = shaped_reward(0.0, None, False, -1, -1, False, hit=1, streak=streak, visible=True)
+        gains.append(rew)
+    assert gains[1] - gains[0] == pytest.approx(STREAK_BONUS) and gains[2] - gains[0] == pytest.approx(2 * STREAK_BONUS)
+    assert shaped_reward(0.0, None, False, -1, -1, False, missed=1, streak=streak, visible=True)[1] == 0
+    # hiding and corners cost every tick
+    assert r(0.01, None, False, -1, -1, False, visible=False) < idle < r(0.01, None, False, -1, -1, False, visible=True) + 1e-9
+    assert r(0.01, None, False, -1, -1, False, visible=True, corner=True) < idle
+    assert in_corner(30.0, 40.0) and in_corner(1190.0, 790.0) and not in_corner(30.0, 400.0) and not in_corner(600.0, 400.0)
+    # a bullet cannot touch a 26 px wide hull from 300 px away when the turret is 3 degrees off the lead point (300 px * tan(2.5 deg) = 13 px)
+    assert off_aim(math.radians(3.0), 300 / 1442.2) and not off_aim(math.radians(2.0), 300 / 1442.2)
 
 
 def test_vec_env_steps_resets_and_reports_episodes():
@@ -116,6 +145,37 @@ def test_extractor_estimates_velocity_only_from_consecutive_visible_ticks():
     assert f[27] == 0 and f[28] == 0
     f = fx(dict(base, enemy_rel_x=0.31))                       # visible again, but the previous tick was hidden
     assert f[27] == 0
+
+
+def test_bullet_threat_picks_the_incoming_enemy_bullet():
+    from mytrain.gru_policy import THREAT_TICKS, bullet_threat
+    me = (600.0, 400.0)
+    # enemy bullet 90 px ahead flying straight at us (9 px/tick): closest approach in 10 ticks, dead centre
+    urgency, miss, side = bullet_threat(dict(bullets=[[90 / 1200, 0.0, -1.0, 0.0, 1.0]]), me, 0.0)
+    assert abs(urgency - (1 - 10 / THREAT_TICKS)) < 1e-6 and miss < 1e-6 and side == 0.0
+    # flying away, or ours: no threat (urgency 0, miss distance 2 = "none", side 0)
+    assert bullet_threat(dict(bullets=[[90 / 1200, 0.0, 1.0, 0.0, 1.0]]), me, 0.0) == (0.0, 2.0, 0.0)
+    assert bullet_threat(dict(bullets=[[90 / 1200, 0.0, -1.0, 0.0, 0.0]]), me, 0.0) == (0.0, 2.0, 0.0)
+    # passing 20 px to the left of our heading: miss 20/40, side +0.5; the nearer-in-time of two bullets wins
+    near = [60 / 1200, 20 / 800, -1.0, 0.0, 1.0]
+    far = [200 / 1200, 0.0, -1.0, 0.0, 1.0]
+    urgency, miss, side = bullet_threat(dict(bullets=[far, near]), me, 0.0)
+    assert abs(urgency - (1 - 60 / 9 / THREAT_TICKS)) < 1e-6 and abs(miss - 0.5) < 1e-6 and abs(side - 0.5) < 1e-6
+
+
+def test_extractor_detects_enemy_shots_from_new_bullets():
+    from mytrain.gru_policy import NO_SHOT
+    fx = FeatureExtractor()
+    base = dict(x=0.5, y=0.5, body_angle=0.0, turret_angle=0.0, enemy_rel_x=0.25, enemy_visible=True)
+    fx(base)
+    assert fx.enemy_age == NO_SHOT
+    fx(dict(base, bullets=[[0.1, 0.0, -1.0, 0.0, 1.0]]))
+    assert fx.enemy_age == 0                                   # a bullet nobody explains = the enemy just fired
+    fx(dict(base, bullets=[[0.1 - 9 / 1200, 0.0, -1.0, 0.0, 1.0]]))
+    assert fx.enemy_age == 1                                   # the same bullet one tick later: no new shot
+    f = fx(dict(base, bullets=[[0.1 - 18 / 1200, 0.0, -1.0, 0.0, 1.0], [0.2, 0.3, -1.0, 0.0, 1.0]]))
+    assert fx.enemy_age == 0                                   # a second one appears
+    assert f.shape == (FEATURE_DIM,) and 0.0 < f[-1] < 1.0     # the shot probability is a probability
 
 
 def test_exported_agent_is_standalone_and_plays_in_the_referee(tmp_path):

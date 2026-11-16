@@ -21,7 +21,7 @@ class EvalPool:
         self.pool = mp.get_context("spawn").Pool(self.n)
 
     def scores(self, params, opponent_params, seeds):
-        """-> (score vs the rule-based bot, score vs `opponent_params`); score = (W + D/2) / games, both sides."""
+        """-> (score vs the rule-based bot, score vs `opponent_params`); score = W / games, both sides (a draw is worth nothing)."""
         seeds = list(seeds)
         chunks = [seeds[i::self.n] for i in range(self.n) if seeds[i::self.n]]
         jobs = [("bot", params, None, c) for c in chunks] + [("net", params, opponent_params, c) for c in chunks]
@@ -29,8 +29,8 @@ class EvalPool:
         k = len(chunks)
 
         def score(part):
-            w, d, g = (sum(x[i] for x in part) for i in range(3))
-            return (w + 0.5 * d) / g
+            w, _, g = (sum(x[i] for x in part) for i in range(3))
+            return w / g
 
         return score(out[:k]), score(out[k:])
 

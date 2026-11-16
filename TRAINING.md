@@ -11,7 +11,7 @@ PYTHONPATH=../playground/python:. python3 train_ppo.py --save-dir runs/a  --step
 ```
 
 ## What it trains
-- **Policy**: `27 inputs -> tanh(Linear 256) -> GRU 256 -> 3 move means + shoot logit` (+ value head). ~0.4M parameters.
+- **Policy**: `36 inputs (v1.2; 27 / 31 before) -> tanh(Linear 256) -> GRU 256 -> 3 move means + shoot logit` (+ value head). ~0.4M parameters.
   The GRU is the agent's memory: with fog of war it can remember where the enemy was, where the walls are, how long ago it saw them.
 - **Input**: `VectorObservationAdapter` (27 features). Inputs are fixed on purpose so every hall-of-fame snapshot can be replayed by the NumPy policy.
 - **Exported agent is pure NumPy** (`mytrain/gru_policy.py`, verified against torch by `--self-check`): no PyTorch on the laptop,
@@ -24,13 +24,22 @@ rule-based bot as a fixed anchor. Maps are random every episode, the learner pla
 
 Reward (training only — arena rules and referee are untouched; see `mytrain/selfplay_env.py`):
 
+**(Rules v1.2 version of this table - the old one was: win +100, draw -10 - 40 extra.)**
+
 | Term | Value | Why |
 |---|---|---|
 | hit dealt / hit taken | +15 / -10 | engine reward, attack is worth more than defence |
-| win / loss | +100 / -100 | engine reward |
+| end of game | **+100 only for a kill; -100 for everything else** (killed, timeout even with more HP, both dead) | the engine's own +-100 / -10 are subtracted again; "draw = loss, a win is a kill" |
 | time penalty | -0.02 per tick | stalling is never free (a 1500-tick stall costs -30) |
-| draw / timeout | -10 engine, **-40 extra** | a draw is clearly worse than winning, closer to a loss than to a win |
-| shaping `gamma*phi(s') - phi(s)` | `phi = -3*aim_error - 3*dist` | closing in and aiming is rewarded; potential-based, so it doesn't change which policy is optimal |
+| shot without a visible enemy | -1 | no shooting into the void |
+| shot off the lead point | -0.5 | when `|lead error| > atan(13 px / distance)` the bullet cannot touch the hull |
+| bullet into a wall / the border | -1 per bullet | |
+| hit streak | +5 * (k-1) for the k-th consecutive hit | a missed bullet resets it |
+| shaping `gamma*phi(s') - phi(s)` | `phi = -3*aim_error - 3*dist + 2*enemy_visible` | closing in, aiming and **finding the enemy** are rewarded; potential-based |
+| hiding / corners / stuck | -0.01 per tick without sight, -0.05 in a corner (< 80 px from two borders), -0.05 driving into something | |
+
+The three shot penalties are scaled up from 0 to full over the first `--shot-penalty-warmup` (10%) of `--steps`: a fresh net shoots almost at random and would otherwise learn "never shoot" (which guarantees -100).
+Log: `kill / died / timeout`, `shots` per episode (20 = the whole magazine), `hit` (share of shots that hit), `dry` (episodes ending with an empty magazine and no kill).
 
 All knobs are constants at the top of `mytrain/selfplay_env.py` (and `--bot-prob`, `--latest-prob`, `--snapshot-every`, `--hof-size`, ... in `train_ppo.py`).
 
@@ -137,3 +146,35 @@ Observed on the first strong agent: it hugged walls, shot at where the enemy *wa
   into something: commanded speed > 1 px/tick but moved < 30% of it; GPU arena only) and the aim shaping now uses the lead error.
 - **Jitter**: ablation on the first agent: moves need no exploration noise (0.86 exact, 0.91 with 0.25, 0.83 with the full 0.5); only the
   *shot* must stay sampled (its probability sat at ~0.45 on every tick). So moves are played with `MOVE_NOISE_SCALE` (0.5) x exp(log_std).
+
+## v1.2: 20 shots, rectangular tanks, 36 inputs (a NEW run - old checkpoints and hall of fame do not load)
+Feedback after the first duels: the agent hid in corners and did not look for the enemy, fired into the void, and drew instead of killing.
+- **Arena** (shared repo, `RULES_VERSION` 1.2): 20 shots per tank per match; the tank is a 40 x 26 rectangle for bullets, walls, tank-tank, the border, lidar
+  and the renderer. The GPU copy (`gpu_arena.py`) mirrors it (SAT collisions) and `tests/test_gpu_parity.py` checks features, rewards, shot counters and ammo
+  against Rust tick by tick (including games that run out of ammo). The timeout rule of the arena is unchanged (more HP wins) - the *training reward*
+  does not pay for it.
+- **Inputs 36** = 31 + own ammo, the nearest incoming enemy bullet (urgency, miss distance, side: finally something to dodge with), and the probability that
+  the enemy is shooting right now (`sigmoid(theta . [1, its turret error towards us, its reload readiness, distance])`, default theta in `gru_policy.py`).
+- **Reward**: see the table above; evaluation (`EVAL`, `assess.py`, `pick_best.py`) counts only games WON (a draw = 0).
+- `RuleBasedBot` hardly ever finds the enemy on many maps (checked: on 5 of 8 seeds the two bots never see each other), so the `bot` anchor is a weak opponent;
+  judge progress by `vs_old` and the hall of fame.
+
+## Adaptation before each match of a series (`mytrain/adapt.py`, exported next to the agent as `tank_adapt.py`)
+The referee keeps the agent's process alive for the whole series and calls `reset()` before every match, so the agent can learn from the match that just ended
+against *this* opponent (fixed number of steps - deterministic, ~1 s; the referee allows 5 s). Switch it on when writing an agent:
+`pick_best.py bundle.zip --out runs/final_adapt --adapt move,shot,bc,rl` (any subset; plain `--out runs/final` = a frozen agent).
+- `move` - ridge regression of the opponent's mean velocity over the next 25 ticks from its current velocity (prior: constant velocity); used only if it beats
+  constant velocity on held-out data; the lead point of the aim uses it.
+- `shot` - refits the 4 numbers of the "enemy is shooting" input on the shots it fired (prior: the defaults).
+- `bc` - rebuilds the opponent's inputs and actions from our telemetry (validated against the engine in `tests/test_adapt.py`; throttle is not trusted where the
+  hull may have been blocked), runs *our* network on its situation and pulls the output layer towards its actions, more before its hits on us.
+- `rl` - REINFORCE on our own match with the training reward.
+Only `w_out`/`b_out` change, never by more than 5% of their norm from the exported weights. The referee never shows the last observation, so the outcome of a match
+is inferred from the tick count and the last HPs (an ambiguous 25-vs-25 ending gives no terminal reward).
+**One game is a very noisy signal: the effect may be zero or negative.** Decide with the referee, same weights with and without adaptation, then against the bot:
+```bash
+python3 pick_best.py bundle.zip --out runs/final_plain
+python3 pick_best.py bundle.zip --out runs/final_adapt --adapt move,shot,bc,rl
+PYTHONPATH=../playground/python python3 ../playground/python/referee.py runs/final_adapt/agent.py runs/final_plain/agent.py --seeds 30
+```
+Keep only the parts that win (try `--adapt move,shot` first: they are the least risky).

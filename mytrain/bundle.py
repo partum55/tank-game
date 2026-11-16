@@ -19,7 +19,7 @@ import subprocess
 import time
 
 METRIC_FIELDS = ["update", "steps", "sps", "win", "loss", "draw", "bot_win", "ep_len",
-                 "pg", "v", "ent", "kl", "eval_vs_bot", "eval_vs_old", "time"]
+                 "shots_ep", "hit_rate", "ammo_out", "pg", "v", "ent", "kl", "eval_vs_bot", "eval_vs_old", "time"]
 
 
 def _git_rev(path: str) -> str:

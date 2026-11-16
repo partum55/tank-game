@@ -9,7 +9,7 @@ from mytrain.gpu_arena import GpuArena, MapBank
 from mytrain.gru_policy import FeatureExtractor
 
 SEEDS = list(range(100, 124))
-TICKS = 350
+TICKS = 480          # > 20 shots x 21 ticks: some games run out of ammo (checked below)
 
 
 def random_actions(rng, ticks):
@@ -21,7 +21,7 @@ def random_actions(rng, ticks):
             cur = rng.uniform(-1, 1, (2, 3))
             cur[:, 0] = np.abs(cur[:, 0]) * 1.0 if rng.random() < 0.7 else cur[:, 0]
         out[t, :, :3] = cur
-        out[t, :, 3] = np.where(rng.random(2) < 0.35, 1.0, -1.0)
+        out[t, :, 3] = np.where(rng.random(2) < 0.5, 1.0, -1.0)
     return out
 
 
@@ -37,7 +37,9 @@ def replay(seeds, ticks, device="cpu", rust_actions=None):
     feat_err = np.zeros((len(seeds), ticks))
     rew_err = np.zeros((len(seeds), ticks))
     done_mismatch = np.zeros(len(seeds), bool)
-    first_div = np.full(len(seeds), ticks)
+    cnt_err = np.zeros((len(seeds), ticks))        # fired / missed / hits / ammo counters vs the Rust info dict
+    cum = np.zeros((3, len(seeds), 2))             # GPU side: cumulative fired, missed, hits dealt
+    ammo_empty = np.zeros(len(seeds), bool)
     finished = np.zeros(len(seeds), bool)
 
     def compare(t, rust_obs):
@@ -51,6 +53,7 @@ def replay(seeds, ticks, device="cpu", rust_actions=None):
     compare(0, rust)
     for t in range(ticks):
         r, done, _ = arena.tick(torch.as_tensor(acts[t]))
+        cum += np.stack([arena.last_fired.numpy(), arena.last_missed.numpy(), arena.last_hits.numpy()[:, ::-1]])
         out = [env.step(acts[t, e, 0], acts[t, e, 1]) for e, env in enumerate(envs)]
         rust_obs = [(o[0], o[1]) for o in out]
         for e, o in enumerate(out):
@@ -59,14 +62,19 @@ def replay(seeds, ticks, device="cpu", rust_actions=None):
             rew_err[e, t] = np.abs(np.array(o[2]) - r[e].numpy()).max()
             if bool(o[3]) != bool(done[e]):
                 done_mismatch[e] = True
+            info = o[4]
+            cnt_err[e, t] = max(np.abs(cum[0, e] - info["shots_fired"]).max(), np.abs(cum[1, e] - info["shots_missed"]).max(),
+                                np.abs(cum[2, e] - info["hits_dealt"]).max(),
+                                np.abs(arena.ammo[e].numpy() - info["ammo"]).max())
+            ammo_empty[e] |= min(info["ammo"]) == 0
             if o[3]:
                 finished[e] = True
         compare(t + 1 if t + 1 < ticks else t, rust_obs)
-    return feat_err, rew_err, done_mismatch
+    return feat_err, rew_err, done_mismatch, cnt_err, ammo_empty
 
 
 def test_gpu_arena_matches_rust_tick_by_tick():
-    feat_err, rew_err, done_mismatch = replay(SEEDS, TICKS)
+    feat_err, rew_err, done_mismatch, cnt_err, ammo_empty = replay(SEEDS, TICKS)
     # per-env: first tick where the features differ by more than 2e-3 (float32 trig can drift near edges)
     bad = feat_err > 2e-3
     diverged = bad.any(1)
@@ -75,3 +83,6 @@ def test_gpu_arena_matches_rust_tick_by_tick():
     assert diverged.sum() <= 2, f"{diverged.sum()} of {len(SEEDS)} games drifted away from Rust"
     assert (rew_err[~diverged] < 1e-4).all()
     assert not done_mismatch[~diverged].any()
+    # shots fired / missed / hits dealt / ammo agree with the Rust engine tick by tick, and the empty-magazine rule was really exercised
+    assert (cnt_err[~diverged] == 0).all(), "shot counters differ from Rust"
+    assert ammo_empty.sum() >= 3, f"only {ammo_empty.sum()} games reached 0 ammo: the ammo rule is not covered"

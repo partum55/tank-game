@@ -5,8 +5,8 @@ Pick the strongest agent of a bundle by a round-robin tournament on the Rust eng
     PYTHONPATH=../playground/python:. python3 pick_best.py bundle.zip [--maps 8] [--extra path/to/policy.npz ...] [--out runs/final]
 
 Candidates: export_best, export_latest, every hof/snap_*.npz in the bundle, the rule-based bot, plus --extra policies.
-Ranking = mean score against all the others (score = (W + D/2) / games). The winner is written as a ready-to-duel agent folder
-(agent.py + policy.npz + tank_gru_policy.py). Self-play strength is relative: the final judge is still the real opponent.
+Ranking = mean score against all the others (score = games won / games; a draw is worth nothing). The winner is written as a ready-to-duel
+agent folder (agent.py + policy.npz + tank_gru_policy.py + tank_adapt.py). Self-play strength is relative: the final judge is still the real opponent.
 """
 import argparse
 import glob
@@ -34,7 +34,8 @@ def _match(job):
 
     res = referee.play_series(_load(a), _load(b), seeds)
     s = res["A"]
-    return a, b, (s["wins"] + 0.5 * s["draws"]) / res["games"], s["wins"], s["losses"], s["draws"]
+    # score = share of games WON (a draw - nobody died before the timeout - is worth nothing, as in the training reward)
+    return a, b, s["wins"] / res["games"], res["B"]["wins"] / res["games"], s["wins"], s["losses"], s["draws"]
 
 
 def main():
@@ -45,7 +46,11 @@ def main():
     ap.add_argument("--only", nargs="*", default=None, help="restrict to these candidate names (a finals round with more maps)")
     ap.add_argument("--procs", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     ap.add_argument("--out", default=None, help="write the winner here as an agent folder")
+    ap.add_argument("--matrix", action="store_true", help="also print the full pairwise score matrix (ROW vs COLUMN)")
     ap.add_argument("--move-noise", type=float, default=None, help="move-noise scale baked into the written agent (0 = exact moves)")
+    ap.add_argument("--adapt", default=None,
+                    help="pre-match adaptation baked into the written agent: any of move,shot,bc,rl (comma separated). Write the same weights "
+                         "with and without it and duel the two folders with referee.py: keep only the parts that win")
     args = ap.parse_args()
 
     root = open_bundle(args.bundle)
@@ -69,9 +74,9 @@ def main():
         results = pool.map(_match, jobs, chunksize=1)
 
     M = {}
-    for a, b, sc, *_ in results:
-        M[path_to_name[a], path_to_name[b]] = sc
-        M[path_to_name[b], path_to_name[a]] = 1.0 - sc
+    for a, b, sa, sb, *_ in results:
+        M[path_to_name[a], path_to_name[b]] = sa
+        M[path_to_name[b], path_to_name[a]] = sb
     mean = {n: float(np.mean([M[n, m] for m in names if m != n])) for n in names}
     order = sorted(names, key=lambda n: -mean[n])
     noisy = {n: n == "bot" or "log_std" in np.load(cands[n]).files for n in names}
@@ -79,13 +84,18 @@ def main():
     for i, n in enumerate(order, 1):
         note = "" if noisy[n] else "   (no log_std in the file: plays deterministically - an older export, probably weaker than it is)"
         print(f"{i:>4} {n:22s} {mean[n]:5.2f} {('-' if n == 'bot' else format(M[n, 'bot'], '.2f')):>7}{note}")
+    if args.matrix:
+        print(f"\nscore of ROW vs COLUMN ({args.maps * 2} games per pair)")
+        print(" " * 18 + "".join(f"{n[:9]:>10}" for n in order))
+        for a in order:
+            print(f"{a:18s}" + "".join(f"{('-' if a == b else format(M[a, b], '.2f')):>10}" for b in order))
     winner = next(n for n in order if n != "bot")
     print(f"\nwinner: {winner} (mean {mean[winner]:.2f}, vs bot {M[winner, 'bot']:.2f})")
     if args.out:
         from mytrain.gru_policy import OPTIONAL_KEYS, PARAM_KEYS, write_standalone_agent
 
         d = np.load(cands[winner])
-        write_standalone_agent(args.out, {k: d[k] for k in PARAM_KEYS + OPTIONAL_KEYS if k in d.files}, args.move_noise)
+        write_standalone_agent(args.out, {k: d[k] for k in PARAM_KEYS + OPTIONAL_KEYS if k in d.files}, args.move_noise, args.adapt)
         print(f"written: {args.out}/agent.py  (noise stored in the weights: {'log_std' in d.files})")
 
 
