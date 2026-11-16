@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "tank_arena"
+version = "0.1.0"
+description = "High-performance 2D tank battle simulation for Genetic Algorithms and Reinforcement Learning"
+authors = [{ name = "Ivan" }]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24.0",
+]
+
+[tool.maturin]
+manifest-path = "crates/tank_pyo3/Cargo.toml"
+module-name = "tank_arena"
+features = ["pyo3/extension-module"]

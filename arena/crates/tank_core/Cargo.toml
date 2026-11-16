@@ -1,0 +1,11 @@
+[package]
+name = "tank_core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+minifb = { version = "0.28", optional = true }
+
+[features]
+default = ["gui"]
+gui = ["dep:minifb"]

@@ -1,0 +1,12 @@
+target/
+.superpowers/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.venv/
+venv/
+checkpoints/
+*.so

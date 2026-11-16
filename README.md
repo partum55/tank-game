@@ -12,4 +12,7 @@ optional adaptation before each match): see `TRAINING.md`.
 
 Review a run: the trainer keeps `<save-dir>/bundle/` fresh (~15 MB); zip it and run `python3 assess.py bundle.zip`.
 
+`arena/` is a snapshot of the shared arena + referee (`../playground` HEAD, rules v1.2) so that Colab needs only this repo; the rules live in
+`../playground`: change them there, commit, run `./sync_arena.sh`, commit the new `arena/`.
+
 Colab: `colab/train_colab.ipynb` (clones the arena repo and this one from GitHub; Drive only holds checkpoints). Details: `TRAINING.md`.
