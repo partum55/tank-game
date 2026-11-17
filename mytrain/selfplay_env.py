@@ -7,11 +7,11 @@ Opponents run inside the worker (NumPy), so the trainer only batches the learner
 
 Reward (training only, the arena and referee are untouched) - built to make the agent WANT to kill:
   engine reward   +15 per hit dealt, -10 per hit taken                                (kept)
-  end of game     +100 ONLY for killing the enemy; everything else (being killed, timeout - even with more HP -, both dead) is -100.
+  end of game     +100 ONLY for killing the enemy; being killed / both dead is -100; timeout with both alive (even with more HP) is -140.
                   The engine's own +-100 / -10 are subtracted again (it still pays HP wins at the timeout).
   - living bonus  the engine's +0.01/step is removed
-  - time penalty  -0.02 per step, so stalling is never free
-  - bad shots     -1 shot without a visible enemy, -0.5 shot clearly off the lead point (the bullet cannot touch the hull), -1 per bullet
+  - time penalty  -0.05 per step, so stalling is never free
+  - bad shots     -1 shot without a visible enemy, -0.1 shot clearly off the lead point (the bullet cannot touch the hull), -0.2 per bullet
                   that ends on a wall / the border. Scaled up from 0 during warm-up (shot_scale) so a fresh net does not learn "never shoot".
   + hit streak    k-th consecutive hit pays +5*(k-1); a missed bullet resets the streak
   + shaping       gamma*phi(s') - phi(s) with phi = -(aim error + distance to enemy) + 2 * enemy visible:
@@ -30,9 +30,10 @@ from tank_env import OFFICIAL_MAX_STEPS, RuleBasedBot, TankEnvironment
 from .gru_policy import FeatureExtractor, NumpyGRUPolicy
 
 GAMMA = 0.997            # must match the PPO discount (potential-based shaping)
-TIME_PENALTY = 0.02
+TIME_PENALTY = 0.05
 LIVING_BONUS_IN_ENGINE = 0.01
 KILL_REWARD, FAIL_REWARD = 100.0, -100.0      # the only win is a kill; every other end of a game is a failure
+TIMEOUT_REWARD = -140.0   # both alive at the time limit: worse than dying, so mutual standoff (dodge everything, never shoot) is not a safe optimum
 ENGINE_END = {"win": 100.0, "loss": -100.0, "draw": -10.0}   # what the engine itself pays at the end (arena result, HP wins included)
 AIM_WEIGHT = 3.0
 DIST_WEIGHT = 3.0
@@ -42,8 +43,8 @@ CORNER_PENALTY = 0.05     # per tick with the tank centre within CORNER_MARGIN p
 CORNER_MARGIN = 80.0
 STUCK_PENALTY = 0.05      # per tick of driving into a wall / tank (commanded speed > 1 px/tick but moved < 30% of it)
 SHOT_BLIND = 1.0          # shot while the enemy is not in sight
-SHOT_OFF = 0.5            # shot with the turret so far off the lead point that the bullet cannot touch the enemy hull
-SHOT_MISS = 1.0           # per bullet that ended on a wall / the border (or against a wall at the muzzle)
+SHOT_OFF = 0.1            # shot with the turret so far off the lead point that the bullet cannot touch the enemy hull
+SHOT_MISS = 0.2           # (small: against an opponent that dodges everything, big miss penalties made "never shoot" optimal) per bullet that ended on a wall / the border (or against a wall at the muzzle)
 STREAK_BONUS = 5.0        # k-th consecutive hit pays STREAK_BONUS * (k - 1)
 HULL_HALF_WIDTH = 13.0    # px, rules v1.2
 ARENA_W, ARENA_H = 1200.0, 800.0
@@ -67,19 +68,19 @@ def in_corner(x_px: float, y_px: float) -> bool:
     return (x_px < CORNER_MARGIN or x_px > ARENA_W - CORNER_MARGIN) and (y_px < CORNER_MARGIN or y_px > ARENA_H - CORNER_MARGIN)
 
 
-def end_reward(killed_enemy: bool) -> float:
-    return KILL_REWARD if killed_enemy else FAIL_REWARD
+def end_reward(killed_enemy: bool, timed_out: bool = False) -> float:
+    return KILL_REWARD if killed_enemy else (TIMEOUT_REWARD if timed_out else FAIL_REWARD)
 
 
 def shaped_reward(engine_reward: float, arena_result, killed: bool, phi_before: float, phi_after: float, done: bool, *,
                   fired=0, missed=0, blind=False, off=False, hit=0, streak=0, visible=True, corner=False, stuck=False,
-                  shot_scale=1.0):
+                  shot_scale=1.0, timed_out=False):
     """One tick of the learner's training reward. `arena_result` = the engine's verdict for the learner ('win' / 'loss' / 'draw' / None while the
     game runs, HP wins at the timeout included), `killed` = the learner is alive and the enemy is dead. Returns (reward, new hit streak)."""
     r = engine_reward - LIVING_BONUS_IN_ENGINE - TIME_PENALTY
     r += GAMMA * phi_after - phi_before
     if done:
-        r += end_reward(killed) - ENGINE_END.get(arena_result, 0.0)
+        r += end_reward(killed, timed_out) - ENGINE_END.get(arena_result, 0.0)
     r -= shot_scale * (SHOT_BLIND * (fired and blind) + SHOT_OFF * (fired and off and not blind) + SHOT_MISS * missed)
     streak = 0 if missed else streak
     if hit:
@@ -142,7 +143,8 @@ class _Slot:
         reward, self.streak = shaped_reward(
             rewards[s], arena_result, killed, self.phi, phi, done, fired=delta["shots_fired"], missed=delta["shots_missed"],
             blind=not visible, off=visible and off_aim(self.fx.lead_err, mine["enemy_dist"]), hit=delta["hits_dealt"],
-            streak=self.streak, visible=visible, corner=in_corner(*pos), stuck=stuck, shot_scale=self.shot_scale)
+            streak=self.streak, visible=visible, corner=in_corner(*pos), stuck=stuck, shot_scale=self.shot_scale,
+            timed_out=bool(done and mine["hp"] > 0 and theirs["hp"] > 0))
         episode = None
         if done:
             died = mine["hp"] <= 0 and theirs["hp"] > 0

@@ -29,11 +29,11 @@ Reward (training only — arena rules and referee are untouched; see `mytrain/se
 | Term | Value | Why |
 |---|---|---|
 | hit dealt / hit taken | +15 / -10 | engine reward, attack is worth more than defence |
-| end of game | **+100 only for a kill; -100 for everything else** (killed, timeout even with more HP, both dead) | the engine's own +-100 / -10 are subtracted again; "draw = loss, a win is a kill" |
-| time penalty | -0.02 per tick | stalling is never free (a 1500-tick stall costs -30) |
+| end of game | **+100 only for a kill; -100 killed / both dead; -140 timeout with both alive** (even with more HP) | the engine's own +-100 / -10 are subtracted again; a timeout is worse than dying, because run 4 (4 h) ended in a standoff: both dodge everything and never shoot |
+| time penalty | -0.05 per tick | stalling is never free (a 1500-tick stall costs -75) |
 | shot without a visible enemy | -1 | no shooting into the void |
-| shot off the lead point | -0.5 | when `|lead error| > atan(13 px / distance)` the bullet cannot touch the hull |
-| bullet into a wall / the border | -1 per bullet | |
+| shot off the lead point | -0.1 | when `|lead error| > atan(13 px / distance)` the bullet cannot touch the hull |
+| bullet into a wall / the border | -0.2 per bullet | kept small: with -1 per miss and an opponent that dodges, "never shoot" was optimal |
 | hit streak | +5 * (k-1) for the k-th consecutive hit | a missed bullet resets it |
 | shaping `gamma*phi(s') - phi(s)` | `phi = -3*aim_error - 3*dist + 2*enemy_visible` | closing in, aiming and **finding the enemy** are rewarded; potential-based |
 | hiding / corners / stuck | -0.01 per tick without sight, -0.05 in a corner (< 80 px from two borders), -0.05 driving into something | |

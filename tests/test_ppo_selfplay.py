@@ -58,8 +58,9 @@ def test_reward_is_aggressive_and_potential_based():
     # the only win is a kill: the engine's HP win at the timeout (+100) becomes -100, a kill stays +100, being killed -100, both dead -100
     # (engine reward = its living bonus 0.01 + its own end-of-game payment)
     assert r(0.01 + 100.0, "win", True, -1.0, -1.0, True, visible=True) == pytest.approx(idle + 100.0)          # kill
-    assert r(0.01 + 100.0, "win", False, -1.0, -1.0, True, visible=True) == pytest.approx(idle - 100.0)         # HP win at the timeout
-    assert r(0.01 - 10.0, "draw", False, -1.0, -1.0, True, visible=True) == pytest.approx(idle - 100.0)         # timeout / both dead
+    assert r(0.01 + 100.0, "win", False, -1.0, -1.0, True, visible=True, timed_out=True) == pytest.approx(idle - 140.0)   # HP win at the timeout
+    assert r(0.01 - 10.0, "draw", False, -1.0, -1.0, True, visible=True, timed_out=True) == pytest.approx(idle - 140.0)   # timeout, both alive
+    assert r(0.01 - 10.0, "draw", False, -1.0, -1.0, True, visible=True) == pytest.approx(idle - 100.0)         # both dead
     assert r(0.01 - 100.0, "loss", False, -1.0, -1.0, True, visible=True) == pytest.approx(idle - 100.0)        # killed
     # a hit gains more than getting hit costs
     assert r(15.0, None, False, -1, -1, False, visible=True, hit=1) > 0 < r(15.0 - 10.0, None, False, -1, -1, False, visible=True)

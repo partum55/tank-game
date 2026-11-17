@@ -17,7 +17,7 @@ from .gpu_arena import DRAW_TIE, DRAW_TIMEOUT, GpuArena, MapBank, T1_WIN, T2_WIN
 from .gru_policy import FEATURE_DIM, MOVE_NOISE_SCALE, OPTIONAL_KEYS, PARAM_KEYS
 from .selfplay_env import (AIM_WEIGHT, CORNER_MARGIN, CORNER_PENALTY, DIAG, DIST_WEIGHT, ENGINE_END, FAIL_REWARD, GAMMA, HIDDEN_PENALTY,
                            HULL_HALF_WIDTH, KILL_REWARD, LIVING_BONUS_IN_ENGINE, SHOT_BLIND, SHOT_MISS, SHOT_OFF, STREAK_BONUS,
-                           STUCK_PENALTY, TIME_PENALTY, VIS_WEIGHT)
+                           STUCK_PENALTY, TIME_PENALTY, TIMEOUT_REWARD, VIS_WEIGHT)
 
 BOT_TARGET_DIST = 0.25
 
@@ -177,7 +177,10 @@ class GpuSelfPlayEnv:
         lose_arena = ((outcome == T2_WIN) & (self.side == 0)) | ((outcome == T1_WIN) & (self.side == 1))
         engine_end = ENGINE_END["win"] * win_arena + ENGINE_END["loss"] * lose_arena \
             + ENGINE_END["draw"] * ((outcome == DRAW_TIE) | (outcome == DRAW_TIMEOUT))
-        end = torch.where(done, torch.where(killed, torch.full_like(phi, KILL_REWARD), torch.full_like(phi, FAIL_REWARD)), torch.zeros_like(phi))
+        timed_out = done & me_alive & foe_alive            # both alive at the limit: worse than dying
+        end = torch.where(done, torch.where(killed, torch.full_like(phi, KILL_REWARD),
+                                            torch.where(timed_out, torch.full_like(phi, TIMEOUT_REWARD), torch.full_like(phi, FAIL_REWARD))),
+                          torch.zeros_like(phi))
 
         streak = torch.where(missed > 0, torch.zeros_like(self.streak), self.streak) + hit
         reward = (me(r_eng) - LIVING_BONUS_IN_ENGINE - TIME_PENALTY + GAMMA * phi - self.phi - engine_end + end
